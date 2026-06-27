@@ -1,10 +1,13 @@
 {
-  "name": "nse-portfolio-tracker",
+  "name": "stock-ml-trading-desk",
   "private": true,
   "version": "0.0.0",
   "type": "module",
   "scripts": {
-    "dev": "vite",
+    "dev": "node scripts/dev.mjs",
+    "dev:ui": "vite --host 127.0.0.1",
+    "dev:ml-api": "node scripts/ml-server.mjs",
+    "ml:run": "cd ml && python3 ML_SYSTEM_FOR_YOUR_MACHINE.py",
     "build": "vite build",
     "lint": "eslint .",
     "preview": "vite preview"
