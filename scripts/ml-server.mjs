@@ -1,5 +1,6 @@
 import { createServer } from "node:http";
 import { spawn } from "node:child_process";
+import { existsSync } from "node:fs";
 import { copyFile, readFile } from "node:fs/promises";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -10,7 +11,14 @@ const mlDir = path.join(rootDir, "ml");
 const mlOutput = path.join(mlDir, "ml_results_final.json");
 const publicOutput = path.join(rootDir, "public", "ml_results_final.json");
 const port = Number(process.env.ML_API_PORT || 8787);
-const python = process.env.PYTHON || process.env.PYTHON_EXEC || "python3";
+const pythonCandidates = [
+  process.env.PYTHON,
+  process.env.PYTHON_EXEC,
+  path.join(rootDir, ".venv", "bin", "python"),
+  path.join(mlDir, ".venv", "bin", "python"),
+  "/Users/tenoasir/Desktop/files/.venv/bin/python",
+].filter(Boolean);
+const python = pythonCandidates.find(existsSync) || "python3";
 
 let child = null;
 let status = {
