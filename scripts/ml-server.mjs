@@ -12,8 +12,8 @@ const mlOutput = path.join(mlDir, "ml_results_final.json");
 const publicOutput = path.join(rootDir, "public", "ml_results_final.json");
 const port = Number(process.env.ML_API_PORT || 8787);
 const pythonCandidates = [
-  process.env.PYTHON,
-  process.env.PYTHON_EXEC,
+  process.env.PYTHON ? path.resolve(process.cwd(), process.env.PYTHON) : null,
+  process.env.PYTHON_EXEC ? path.resolve(process.cwd(), process.env.PYTHON_EXEC) : null,
   path.join(rootDir, ".venv", "bin", "python"),
   path.join(mlDir, ".venv", "bin", "python"),
   "/Users/tenoasir/Desktop/files/.venv/bin/python",

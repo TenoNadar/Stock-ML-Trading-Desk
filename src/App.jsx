@@ -9,6 +9,7 @@ function App() {
   const [mlStatus, setMlStatus] = useState({ state: "idle", message: "ML API not checked yet." });
   const [notice, setNotice] = useState(null);
   const [portfolioVersion, setPortfolioVersion] = useState(0);
+  const [elapsed, setElapsed] = useState(0);
   const lastCompletionRef = useRef(null);
 
   const fetchMlStatus = useCallback(async () => {
@@ -48,6 +49,20 @@ function App() {
     const id = setInterval(fetchMlStatus, 3000);
     return () => clearInterval(id);
   }, [fetchMlStatus]);
+
+  useEffect(() => {
+    let id;
+    if (mlStatus.state === "running" && mlStatus.startedAt) {
+      const update = () => {
+        setElapsed(Math.max(0, Math.floor((Date.now() - new Date(mlStatus.startedAt).getTime()) / 1000)));
+      };
+      update();
+      id = setInterval(update, 1000);
+    } else {
+      setElapsed(0);
+    }
+    return () => clearInterval(id);
+  }, [mlStatus.state, mlStatus.startedAt]);
 
   const runBacktest = async () => {
     setNotice(null);
@@ -142,7 +157,7 @@ function App() {
             padding: "6px 10px",
           }}
         >
-          {mlStatus.state === "running" ? "RUNNING BACKTEST" : "RUN ML BACKTEST"}
+          {mlStatus.state === "running" ? `RUNNING BACKTEST (${Math.floor(elapsed / 60)}m ${elapsed % 60}s)` : "RUN ML BACKTEST"}
         </button>
       </div>
       {view === "signals" ? <OptionsTrader /> : <PortfolioTracker key={portfolioVersion} />}
