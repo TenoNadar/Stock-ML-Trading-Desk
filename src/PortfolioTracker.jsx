@@ -187,6 +187,7 @@ export default function PortfolioTracker() {
   const [backtestData, setBacktestData] = useState({});
   const [backtestMeta, setBacktestMeta] = useState({});
   const [backtestModel, setBacktestModel] = useState("ensemble");
+  const [niftyReturn, setNiftyReturn] = useState(null);
   const timerRef = useRef(null);
 
   useEffect(() => {
@@ -209,6 +210,23 @@ export default function PortfolioTracker() {
         setMlResults([]);
         setBacktestData({});
       });
+  }, []);
+
+  // Fetch NIFTY 50 2-year return for benchmark comparison
+  useEffect(() => {
+    (async () => {
+      try {
+        const url = `https://query1.finance.yahoo.com/v8/finance/chart/%5ENSEI?interval=1d&range=2y`;
+        const res = await fetch(PROXY + encodeURIComponent(url));
+        if (!res.ok) return;
+        const json = await res.json();
+        const closes = json?.chart?.result?.[0]?.indicators?.quote?.[0]?.close?.filter(c => c != null);
+        if (closes && closes.length > 1) {
+          const ret = ((closes[closes.length - 1] - closes[0]) / closes[0]) * 100;
+          setNiftyReturn(ret);
+        }
+      } catch { /* silently fail — benchmark is optional */ }
+    })();
   }, []);
 
   // Fetch live data for all positions
@@ -618,15 +636,67 @@ export default function PortfolioTracker() {
           </div>
         )}
 
-        {/* BACKTEST — 3 models + ensemble */}
-        {tab === "backtest" && (
+        {/* BACKTEST — Deep Analytical Dashboard */}
+        {tab === "backtest" && (() => {
+          const NOTIONAL = 10000;
+          const top5 = [...(currentBacktest || [])].sort((a, b) => b.sharpe - a.sharpe).slice(0, 5);
+          const totalDeployed = top5.length * NOTIONAL;
+
+          // Per-stock simulation
+          const stockSim = top5.map(s => {
+            const shares = Math.floor(NOTIONAL / s.price);
+            const deployed = shares * s.price;
+            const avgRetPct = s.avg_return || 0;
+            const trades = s.trades || 0;
+            const pnl = deployed * (avgRetPct / 100) * trades;
+            const retPct = deployed > 0 ? (pnl / deployed) * 100 : 0;
+            return { ...s, shares, deployed, pnl, retPct, trades, avgRetPct };
+          });
+
+          const totalPnlStrat = stockSim.reduce((s, x) => s + x.pnl, 0);
+          const actualDeployed = stockSim.reduce((s, x) => s + x.deployed, 0);
+          const stratReturn = actualDeployed > 0 ? (totalPnlStrat / actualDeployed) * 100 : 0;
+          const alpha = niftyReturn != null ? stratReturn - niftyReturn : null;
+
+          // Portfolio-level Sharpe & Sortino (weighted by deployed)
+          const wSharpe = actualDeployed > 0
+            ? stockSim.reduce((s, x) => s + x.sharpe * x.deployed, 0) / actualDeployed
+            : 0;
+          const wSortino = actualDeployed > 0
+            ? Math.min(99.99, stockSim.reduce((s, x) => s + (x.sortino || 0) * x.deployed, 0) / actualDeployed)
+            : 0;
+          const wMaxDD = stockSim.length > 0
+            ? Math.min(...stockSim.map(x => x.max_drawdown || 0))
+            : 0;
+          const wWinRate = stockSim.length > 0
+            ? stockSim.reduce((s, x) => s + (x.win_rate || 0), 0) / stockSim.length
+            : 0;
+          const totalWins = stockSim.reduce((s, x) => s + Math.round((x.win_rate / 100) * x.trades), 0);
+          const totalTrds = stockSim.reduce((s, x) => s + x.trades, 0);
+          const winPnl = stockSim.reduce((s, x) => s + (x.pnl > 0 ? x.pnl : 0), 0);
+          const lossPnl = Math.abs(stockSim.reduce((s, x) => s + (x.pnl < 0 ? x.pnl : 0), 0));
+          const profitFactor = lossPnl > 0 ? winPnl / lossPnl : winPnl > 0 ? Infinity : 0;
+
+          const best = stockSim.length > 0 ? stockSim.reduce((a, b) => a.pnl > b.pnl ? a : b) : null;
+          const worst = stockSim.length > 0 ? stockSim.reduce((a, b) => a.pnl < b.pnl ? a : b) : null;
+          const concPct = best && totalPnlStrat !== 0 ? Math.abs(best.pnl / totalPnlStrat) * 100 : 0;
+
+          const niftyCAGR = niftyReturn != null ? ((Math.pow(1 + niftyReturn / 100, 1 / 2) - 1) * 100) : null;
+          const stratCAGR = (Math.pow(1 + stratReturn / 100, 1 / 2) - 1) * 100;
+
+          const kpiBox = { background: "#0a0a1c", border: "1px solid #141428", borderRadius: 8, padding: "12px 14px", textAlign: "center" };
+          const kpiLabel = { fontSize: 8, color: "#555", letterSpacing: 2, marginBottom: 4, fontWeight: 700 };
+          const kpiValue = { fontSize: 16, fontWeight: 700 };
+
+          return (
           <div>
+            {/* Model selector header */}
             <div style={{ background: "#0a0a1c", border: "1px solid #141428", borderRadius: 8, padding: 12, marginBottom: 14 }}>
-              <div style={{ fontSize: 10, color: "#00d084", letterSpacing: 2, fontWeight: 700, marginBottom: 8 }}>MODEL BACKTEST COMPARISON</div>
+              <div style={{ fontSize: 10, color: "#00d084", letterSpacing: 2, fontWeight: 700, marginBottom: 4 }}>STRATEGY BACKTEST — TOP 5 BY SHARPE</div>
               <div style={{ fontSize: 9, color: "#666", lineHeight: 1.8 }}>
-                History: {backtestMeta.history || "2y"} · Horizons: {(backtestMeta.horizons || [3,5,7]).join("/")}D auto-pick ·
+                Deploy ₹{NOTIONAL.toLocaleString("en-IN")} per stock · {backtestMeta.history || "2y"} history · Horizons: {(backtestMeta.horizons || [3,5,7]).join("/")}D ·
                 Target: {backtestMeta.targetType || "weighted"} · Threshold: {backtestMeta.threshold || 0.55} ·
-                Stocks: {backtestMeta.analyzed || "—"}
+                Universe: {backtestMeta.analyzed || "—"} stocks
               </div>
               <div style={{ display: "flex", gap: 8, marginTop: 10, flexWrap: "wrap" }}>
                 {backtestModels.map(m => (
@@ -644,23 +714,189 @@ export default function PortfolioTracker() {
               </div>
             </div>
 
-            {currentBacktest.length === 0 ? (
+            {top5.length === 0 ? (
               <div style={{ textAlign: "center", opacity: 0.3, padding: "40px" }}>
-                <div style={{ fontSize: 12, letterSpacing: 2 }}>No backtest data — run ML_SYSTEM_FOR_YOUR_MACHINE.py</div>
+                <div style={{ fontSize: 12, letterSpacing: 2 }}>No backtest data — run ML backtest first</div>
               </div>
             ) : (
               <>
-                <div style={{ fontSize: 9, color: "#555", marginBottom: 12, letterSpacing: 1 }}>
-                  TOP 20 BY SHARPE — {modelLabels[backtestModel] || backtestModel.toUpperCase()} (dynamic {backtestMeta.horizons?.join("/") || "3/5/7"}D per stock)
-                  {currentBacktest.length > 0 && (
-                    <> · Avg Sharpe {(currentBacktest.reduce((s, r) => s + r.sharpe, 0) / currentBacktest.length).toFixed(2)} · Avg Sortino {(currentBacktest.reduce((s, r) => s + (r.sortino || 0), 0) / currentBacktest.length).toFixed(2)}</>
-                  )}
+                {/* KPI CARDS */}
+                <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fill, minmax(150px, 1fr))", gap: 10, marginBottom: 16 }}>
+                  <div style={kpiBox}>
+                    <div style={kpiLabel}>TOTAL DEPLOYED</div>
+                    <div style={{ ...kpiValue, color: "#dde0f0" }}>₹{actualDeployed.toLocaleString("en-IN")}</div>
+                  </div>
+                  <div style={kpiBox}>
+                    <div style={kpiLabel}>STRATEGY PnL</div>
+                    <div style={{ ...kpiValue, color: totalPnlStrat >= 0 ? "#00d084" : "#ff4d6d" }}>
+                      {totalPnlStrat >= 0 ? "+" : ""}₹{totalPnlStrat.toFixed(0)}
+                    </div>
+                    <div style={{ fontSize: 9, color: stratReturn >= 0 ? "#00d084" : "#ff4d6d", marginTop: 2 }}>
+                      {stratReturn >= 0 ? "+" : ""}{stratReturn.toFixed(1)}%
+                    </div>
+                  </div>
+                  <div style={kpiBox}>
+                    <div style={kpiLabel}>NIFTY 2Y RETURN</div>
+                    <div style={{ ...kpiValue, color: niftyReturn == null ? "#555" : niftyReturn >= 0 ? "#00b4d8" : "#ff4d6d" }}>
+                      {niftyReturn == null ? "Loading…" : `${niftyReturn >= 0 ? "+" : ""}${niftyReturn.toFixed(1)}%`}
+                    </div>
+                  </div>
+                  <div style={kpiBox}>
+                    <div style={kpiLabel}>ALPHA</div>
+                    <div style={{ ...kpiValue, color: alpha == null ? "#555" : alpha >= 0 ? "#00d084" : "#ff4d6d" }}>
+                      {alpha == null ? "—" : `${alpha >= 0 ? "+" : ""}${alpha.toFixed(1)}%`}
+                    </div>
+                  </div>
+                  <div style={kpiBox}>
+                    <div style={kpiLabel}>PORTFOLIO SHARPE</div>
+                    <div style={{ ...kpiValue, color: wSharpe > 2 ? "#00d084" : "#f0b429" }}>{wSharpe.toFixed(2)}</div>
+                  </div>
+                  <div style={kpiBox}>
+                    <div style={kpiLabel}>WIN RATE</div>
+                    <div style={{ ...kpiValue, color: wWinRate > 55 ? "#00d084" : "#f0b429" }}>{wWinRate.toFixed(0)}%</div>
+                  </div>
+                  <div style={kpiBox}>
+                    <div style={kpiLabel}>PROFIT FACTOR</div>
+                    <div style={{ ...kpiValue, color: profitFactor > 1.5 ? "#00d084" : "#f0b429" }}>
+                      {profitFactor === Infinity ? "∞" : profitFactor.toFixed(2)}
+                    </div>
+                  </div>
+                  <div style={kpiBox}>
+                    <div style={kpiLabel}>MAX DRAWDOWN</div>
+                    <div style={{ ...kpiValue, color: "#ff4d6d" }}>{wMaxDD.toFixed(1)}%</div>
+                  </div>
                 </div>
-                {renderStockCards(currentBacktest, `bt-${backtestModel}`)}
+
+                {/* STRATEGY vs NIFTY COMPARISON TABLE */}
+                <div style={{ background: "#0a0a1c", border: "1px solid #141428", borderRadius: 8, padding: 14, marginBottom: 16 }}>
+                  <div style={{ fontSize: 10, color: "#00d084", letterSpacing: 2, fontWeight: 700, marginBottom: 12 }}>STRATEGY vs NIFTY 50 COMPARISON</div>
+                  <table style={{ width: "100%", borderCollapse: "collapse", fontSize: 10 }}>
+                    <thead>
+                      <tr style={{ borderBottom: "1px solid #1a1a32" }}>
+                        <th style={{ padding: "8px 10px", textAlign: "left", color: "#555", fontWeight: 700, letterSpacing: 1 }}>METRIC</th>
+                        <th style={{ padding: "8px 10px", textAlign: "right", color: "#00d084", fontWeight: 700, letterSpacing: 1 }}>ML TOP 5</th>
+                        <th style={{ padding: "8px 10px", textAlign: "right", color: "#00b4d8", fontWeight: 700, letterSpacing: 1 }}>NIFTY 50</th>
+                      </tr>
+                    </thead>
+                    <tbody>
+                      {[
+                        ["2Y Return", `${stratReturn >= 0 ? "+" : ""}${stratReturn.toFixed(1)}%`, niftyReturn != null ? `${niftyReturn >= 0 ? "+" : ""}${niftyReturn.toFixed(1)}%` : "—"],
+                        ["CAGR", `${stratCAGR >= 0 ? "+" : ""}${stratCAGR.toFixed(1)}%`, niftyCAGR != null ? `${niftyCAGR >= 0 ? "+" : ""}${niftyCAGR.toFixed(1)}%` : "—"],
+                        ["Sharpe Ratio", wSharpe.toFixed(2), "~1.0 (typical)"],
+                        ["Sortino Ratio", wSortino.toFixed(2), "—"],
+                        ["Max Drawdown", `${wMaxDD.toFixed(1)}%`, "—"],
+                        ["Win Rate", `${wWinRate.toFixed(0)}%`, "—"],
+                        ["Profit Factor", profitFactor === Infinity ? "∞" : profitFactor.toFixed(2), "—"],
+                        ["Total Trades", String(totalTrds), "—"],
+                        ["Total PnL", `₹${totalPnlStrat.toFixed(0)}`, niftyReturn != null ? `₹${(actualDeployed * niftyReturn / 100).toFixed(0)}` : "—"],
+                      ].map(([metric, strat, nifty], i) => (
+                        <tr key={i} style={{ borderBottom: "1px solid #0e0e20" }}>
+                          <td style={{ padding: "7px 10px", color: "#889" }}>{metric}</td>
+                          <td style={{ padding: "7px 10px", textAlign: "right", color: "#dde0f0", fontWeight: 700 }}>{strat}</td>
+                          <td style={{ padding: "7px 10px", textAlign: "right", color: "#88bbcc" }}>{nifty}</td>
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
+                </div>
+
+                {/* PER-STOCK BREAKDOWN TABLE */}
+                <div style={{ background: "#0a0a1c", border: "1px solid #141428", borderRadius: 8, padding: 14, marginBottom: 16 }}>
+                  <div style={{ fontSize: 10, color: "#00d084", letterSpacing: 2, fontWeight: 700, marginBottom: 12 }}>PER-STOCK BREAKDOWN — ₹{NOTIONAL.toLocaleString("en-IN")} EACH</div>
+                  <div style={{ overflowX: "auto" }}>
+                    <table style={{ width: "100%", borderCollapse: "collapse", fontSize: 9, minWidth: 700 }}>
+                      <thead>
+                        <tr style={{ borderBottom: "1px solid #1a1a32" }}>
+                          {["#", "STOCK", "CAP", "PRICE", "SHARES", "DEPLOYED", "HORIZON", "TRADES", "AVG RET", "SHARPE", "WIN RATE", "PnL", "RETURN"].map(h => (
+                            <th key={h} style={{ padding: "6px 8px", textAlign: h === "STOCK" ? "left" : "right", color: "#555", fontWeight: 700, letterSpacing: 1, whiteSpace: "nowrap" }}>{h}</th>
+                          ))}
+                        </tr>
+                      </thead>
+                      <tbody>
+                        {stockSim.map((s, i) => (
+                          <tr key={s.symbol} style={{ borderBottom: "1px solid #0e0e20" }}>
+                            <td style={{ padding: "7px 8px", color: "#444", textAlign: "right" }}>{i + 1}</td>
+                            <td style={{ padding: "7px 8px", color: "#dde0f0", fontWeight: 700, textAlign: "left" }}>
+                              {s.name}
+                              <span style={{ color: "#444", fontWeight: 400, marginLeft: 6 }}>{s.symbol.replace(".NS", "")}</span>
+                            </td>
+                            <td style={{ padding: "7px 8px", color: "#666", textAlign: "right" }}>{s.cap}</td>
+                            <td style={{ padding: "7px 8px", color: "#889", textAlign: "right" }}>₹{s.price.toFixed(0)}</td>
+                            <td style={{ padding: "7px 8px", color: "#889", textAlign: "right" }}>{s.shares}</td>
+                            <td style={{ padding: "7px 8px", color: "#889", textAlign: "right" }}>₹{s.deployed.toFixed(0)}</td>
+                            <td style={{ padding: "7px 8px", color: "#00b4d8", textAlign: "right" }}>{s.best_horizon || 5}D</td>
+                            <td style={{ padding: "7px 8px", color: "#889", textAlign: "right" }}>{s.trades}</td>
+                            <td style={{ padding: "7px 8px", color: s.avgRetPct >= 0 ? "#00d084" : "#ff4d6d", textAlign: "right" }}>{s.avgRetPct.toFixed(2)}%</td>
+                            <td style={{ padding: "7px 8px", color: s.sharpe > 3 ? "#00d084" : "#f0b429", textAlign: "right", fontWeight: 700 }}>{s.sharpe.toFixed(2)}</td>
+                            <td style={{ padding: "7px 8px", color: s.win_rate > 55 ? "#00d084" : "#f0b429", textAlign: "right" }}>{s.win_rate.toFixed(0)}%</td>
+                            <td style={{ padding: "7px 8px", color: s.pnl >= 0 ? "#00d084" : "#ff4d6d", textAlign: "right", fontWeight: 700 }}>
+                              {s.pnl >= 0 ? "+" : ""}₹{s.pnl.toFixed(0)}
+                            </td>
+                            <td style={{ padding: "7px 8px", color: s.retPct >= 0 ? "#00d084" : "#ff4d6d", textAlign: "right", fontWeight: 700 }}>
+                              {s.retPct >= 0 ? "+" : ""}{s.retPct.toFixed(1)}%
+                            </td>
+                          </tr>
+                        ))}
+                        {/* Totals row */}
+                        <tr style={{ borderTop: "2px solid #00d08444" }}>
+                          <td colSpan={5} style={{ padding: "8px 8px", color: "#00d084", fontWeight: 700, textAlign: "left", letterSpacing: 1 }}>TOTAL</td>
+                          <td style={{ padding: "8px 8px", color: "#dde0f0", fontWeight: 700, textAlign: "right" }}>₹{actualDeployed.toFixed(0)}</td>
+                          <td colSpan={5} />
+                          <td style={{ padding: "8px 8px", color: totalPnlStrat >= 0 ? "#00d084" : "#ff4d6d", fontWeight: 700, textAlign: "right" }}>
+                            {totalPnlStrat >= 0 ? "+" : ""}₹{totalPnlStrat.toFixed(0)}
+                          </td>
+                          <td style={{ padding: "8px 8px", color: stratReturn >= 0 ? "#00d084" : "#ff4d6d", fontWeight: 700, textAlign: "right" }}>
+                            {stratReturn >= 0 ? "+" : ""}{stratReturn.toFixed(1)}%
+                          </td>
+                        </tr>
+                      </tbody>
+                    </table>
+                  </div>
+                </div>
+
+                {/* RISK ANALYSIS */}
+                <div style={{ background: "#0a0a1c", border: "1px solid #141428", borderRadius: 8, padding: 14 }}>
+                  <div style={{ fontSize: 10, color: "#00d084", letterSpacing: 2, fontWeight: 700, marginBottom: 12 }}>RISK ANALYSIS</div>
+                  <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fill, minmax(220px, 1fr))", gap: 10 }}>
+                    <div style={{ background: "#070712", borderRadius: 6, padding: 12 }}>
+                      <div style={{ fontSize: 8, color: "#555", letterSpacing: 1, marginBottom: 6 }}>BEST PERFORMER</div>
+                      <div style={{ fontSize: 12, color: "#00d084", fontWeight: 700 }}>{best?.name || "—"}</div>
+                      <div style={{ fontSize: 10, color: "#00d084" }}>+₹{best?.pnl.toFixed(0) || 0} ({best?.retPct.toFixed(1) || 0}%)</div>
+                    </div>
+                    <div style={{ background: "#070712", borderRadius: 6, padding: 12 }}>
+                      <div style={{ fontSize: 8, color: "#555", letterSpacing: 1, marginBottom: 6 }}>WORST PERFORMER</div>
+                      <div style={{ fontSize: 12, color: "#ff4d6d", fontWeight: 700 }}>{worst?.name || "—"}</div>
+                      <div style={{ fontSize: 10, color: worst && worst.pnl >= 0 ? "#00d084" : "#ff4d6d" }}>
+                        {worst ? `${worst.pnl >= 0 ? "+" : ""}₹${worst.pnl.toFixed(0)} (${worst.retPct.toFixed(1)}%)` : "—"}
+                      </div>
+                    </div>
+                    <div style={{ background: "#070712", borderRadius: 6, padding: 12 }}>
+                      <div style={{ fontSize: 8, color: "#555", letterSpacing: 1, marginBottom: 6 }}>CONCENTRATION RISK</div>
+                      <div style={{ fontSize: 12, color: concPct > 60 ? "#ff4d6d" : "#f0b429", fontWeight: 700 }}>{concPct.toFixed(0)}%</div>
+                      <div style={{ fontSize: 9, color: "#666" }}>of PnL from top stock</div>
+                    </div>
+                    <div style={{ background: "#070712", borderRadius: 6, padding: 12 }}>
+                      <div style={{ fontSize: 8, color: "#555", letterSpacing: 1, marginBottom: 6 }}>PORTFOLIO SORTINO</div>
+                      <div style={{ fontSize: 12, color: wSortino > 2 ? "#00d084" : "#f0b429", fontWeight: 700 }}>{wSortino.toFixed(2)}</div>
+                      <div style={{ fontSize: 9, color: "#666" }}>downside risk-adjusted</div>
+                    </div>
+                    <div style={{ background: "#070712", borderRadius: 6, padding: 12 }}>
+                      <div style={{ fontSize: 8, color: "#555", letterSpacing: 1, marginBottom: 6 }}>STRATEGY CAGR</div>
+                      <div style={{ fontSize: 12, color: stratCAGR >= 0 ? "#00d084" : "#ff4d6d", fontWeight: 700 }}>{stratCAGR.toFixed(1)}%</div>
+                      <div style={{ fontSize: 9, color: "#666" }}>annualised over 2 years</div>
+                    </div>
+                    <div style={{ background: "#070712", borderRadius: 6, padding: 12 }}>
+                      <div style={{ fontSize: 8, color: "#555", letterSpacing: 1, marginBottom: 6 }}>WINS / TOTAL SIGNALS</div>
+                      <div style={{ fontSize: 12, color: "#dde0f0", fontWeight: 700 }}>{totalWins} / {totalTrds}</div>
+                      <div style={{ fontSize: 9, color: "#666" }}>across all 5 stocks</div>
+                    </div>
+                  </div>
+                </div>
               </>
             )}
           </div>
-        )}
+          );
+        })()}
 
         {/* ADD POSITION */}
         {tab === "addnew" && (
