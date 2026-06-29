@@ -31,7 +31,7 @@ warnings.filterwarnings('ignore')
 SCRIPT_DIR = Path(__file__).resolve().parent
 OUTPUT_FILE = SCRIPT_DIR.parent / "public" / "ml_results_final.json"
 
-HORIZON_CANDIDATES = [3, 5, 7]
+# HORIZON_CANDIDATES removed in favor of dynamic derivation
 PREDICTION_THRESHOLD = 0.40
 MIN_TRADES = 3
 TRAIN_RATIO = 0.7
@@ -369,6 +369,38 @@ def time_decay_weights(horizon):
     """Later days in the forward window get higher weight (sustainability)."""
     w = np.arange(1, horizon + 1, dtype=float)
     return w / w.sum()
+
+def derive_optimal_horizon(prices, volumes, min_h=2, max_h=15):
+    """
+    Mathematically derive the optimal holding period (horizon) using the
+    zero-crossing of the Volume-Weighted Autocorrelation Function (ACF).
+    """
+    rets = np.log(prices / prices.shift(1)).fillna(0)
+    vol_sma = volumes.rolling(window=20).mean()
+    vol_ratio = (volumes / (vol_sma + 1e-8)).fillna(1)
+    vw_rets = (rets * vol_ratio).dropna().values
+    
+    n = len(vw_rets)
+    if n < max_h * 2:
+        return 5
+        
+    mean = np.mean(vw_rets)
+    var = np.var(vw_rets)
+    if var == 0:
+        return 5
+        
+    acf = []
+    for lag in range(1, max_h + 2):
+        cov = np.sum((vw_rets[:-lag] - mean) * (vw_rets[lag:] - mean)) / n
+        acf.append(cov / var)
+        
+    optimal_h = max_h
+    for lag_idx, val in enumerate(acf):
+        if val <= 0:
+            optimal_h = lag_idx + 1
+            break
+            
+    return max(min_h, min(optimal_h, max_h))
 
 def build_weighted_target(df, horizon):
     """
@@ -712,28 +744,11 @@ def analyze_stock(symbol, name, cap_type):
         last_data_date = pd.to_datetime(df_clean['Date'].iloc[-1]).date().isoformat()
         X_feat = define_features(df_clean)
 
-        # ── Phase 1: compare 3 / 5 / 7-day weighted horizons (ensemble) ──
-        horizon_comparison = {}
-        for h in HORIZON_CANDIDATES:
-            metrics = run_horizon_ensemble(df_clean, h)
-            if metrics:
-                metrics['composite_score'] = horizon_composite_score(metrics)
-                metrics.pop('trade_log', None)
-                metrics.pop('probas', None)
-                horizon_comparison[str(h)] = metrics
+        # ── Phase 1: Mathematically derive optimal horizon ──
+        best_h = derive_optimal_horizon(df_clean['Close'], df_clean['Volume'])
+        horizon_comparison = {str(best_h): {'sharpe': 0}} # Mock for compatibility
 
-        if not horizon_comparison:
-            print("❌ Too few signals")
-            return None
-
-        best_horizon = max(
-            horizon_comparison.keys(),
-            key=lambda k: horizon_comparison[k]['composite_score']
-        )
-        best_h = int(best_horizon)
-        best_ens = horizon_comparison[best_horizon]
-
-        # ── Phase 2: full model suite on best horizon ──
+        # ── Phase 2: full model suite on derived horizon ──
         X = define_features(df_clean)
         y = build_weighted_target(df_clean, best_h).values
         valid_mask = valid_sample_mask(X, y)
@@ -759,10 +774,11 @@ def analyze_stock(symbol, name, cap_type):
         ensemble_metrics = run_ensemble_pipeline(
             models, X_train, y_train, X_scaled, df_valid, train_size, best_h
         )
-        if ensemble_metrics:
-            model_results['ensemble'] = ensemble_metrics
-
-        ens = model_results.get('ensemble', best_ens)
+        if not ensemble_metrics:
+            print("❌ Ensemble failed")
+            return None
+            
+        ens = ensemble_metrics
 
         # ── Collect test-period data for cross-sectional portfolio backtest ──
         test_dates = []
@@ -1006,7 +1022,7 @@ if __name__ == '__main__':
     print("DYNAMIC ML — PER-STOCK 3D / 5D / 7D WEIGHTED HORIZON OPTIMISER")
     print("="*100)
     print(f"\nData Mode: {'REAL Yahoo Finance' if USE_REAL_DATA else 'SIMULATED (for demo)'}")
-    print(f"History: 2 years | Horizons tested: {HORIZON_CANDIDATES} | Threshold: {PREDICTION_THRESHOLD}")
+    print(f"History: 2 years | Horizon: Dynamic (Vol-Weighted ACF) | Threshold: {PREDICTION_THRESHOLD}")
     print(f"Target: volume+time weighted | Anti-chase: {CHASE_FILTER*100:.0f}% | Universe: {len(STOCKS)} stocks\n")
 
     all_results = []
@@ -1076,16 +1092,12 @@ if __name__ == '__main__':
         rr = (r['t1'] - r['price']) / (r['price'] - r['sl'] + 1e-8)
         bh = r.get('best_horizon', 5)
 
-        print(f"\n{i}. {r['name']:20} ({r['symbol']:15}) {emoji}  [Best: {bh}D]")
+        print(f"\n{i}. {r['name']:20} ({r['symbol']:15}) {emoji}  [Horizon: {bh}D]")
         print(f"   Sharpe: {r['sharpe']:.2f} | Sortino: {r.get('sortino', 0):.2f} | MD: {r.get('max_drawdown', 0):.1f}% | Avg: {r.get('avg_return', 0):.2f}%")
         print(f"   WR: {r['win_rate']:.0f}% | Trades: {r['trades']} | CV: {r['cv_accuracy']:.0%}")
         print(f"   Entry: ₹{r['price']:.2f} | SL: ₹{r['sl']:.2f} | T1: ₹{r['t1']:.2f} | T2: ₹{r['t2']:.2f} | R:R {rr:.2f}:1")
-        hc = r.get('horizon_comparison', {})
-        if hc:
-            parts = [f"{k}D→S={hc[k]['sharpe']:.1f}" for k in sorted(hc.keys(), key=int)]
-            print(f"   Horizon test: {' | '.join(parts)}")
 
-    print(f"\n  Best horizon distribution (top 20): 3D={horizon_counts.get(3,0)} | 5D={horizon_counts.get(5,0)} | 7D={horizon_counts.get(7,0)}")
+    print(f"\n  Dynamic horizon derived via Volume-Weighted ACF Memory Decay")
 
     print("\n" + "="*100)
     print("MODEL COMPARISON (avg Sharpe of top-20 per model)")
@@ -1101,7 +1113,7 @@ if __name__ == '__main__':
             'mode': 'REAL' if USE_REAL_DATA else 'DEMO',
             'generated_at': datetime.now().astimezone().isoformat(timespec='seconds'),
             'history': '2y',
-            'horizons_tested': HORIZON_CANDIDATES,
+            'horizons_tested': 'dynamic_acf',
             'target_type': 'volume_time_weighted',
             'threshold': PREDICTION_THRESHOLD,
             'min_weighted_return': MIN_WEIGHTED_RETURN,
