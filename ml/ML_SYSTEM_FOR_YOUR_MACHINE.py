@@ -252,19 +252,53 @@ def generate_simulated_data(symbol, base_price=1500):
 # FEATURE ENGINEERING (look-ahead safe)
 # ═══════════════════════════════════════════════════════════════
 
-def calculate_rsi(prices, period=14):
-    delta = prices.diff()
-    gain = (delta.where(delta > 0, 0)).rolling(window=period).mean()
-    loss = (-delta.where(delta < 0, 0)).rolling(window=period).mean()
-    rs = gain / (loss + 1e-8)
-    return 100 - (100 / (1 + rs))
+def kalman_filter_trend(series):
+    n = len(series)
+    xhat = np.zeros(n)
+    P = np.zeros(n)
+    xhatminus = np.zeros(n)
+    Pminus = np.zeros(n)
+    K = np.zeros(n)
+    Q = 1e-5
+    R = 1e-3
+    xhat[0] = series.iloc[0]
+    P[0] = 1.0
+    for k in range(1, n):
+        xhatminus[k] = xhat[k-1]
+        Pminus[k] = P[k-1] + Q
+        K[k] = Pminus[k] / (Pminus[k] + R)
+        xhat[k] = xhatminus[k] + K[k] * (series.iloc[k] - xhatminus[k])
+        P[k] = (1 - K[k]) * Pminus[k]
+    return pd.Series(xhat, index=series.index)
 
-def calculate_macd(prices):
-    ema_fast = prices.ewm(span=12, adjust=False).mean()
-    ema_slow = prices.ewm(span=26, adjust=False).mean()
-    macd = ema_fast - ema_slow
-    signal = macd.ewm(span=9, adjust=False).mean()
-    return macd, signal, macd - signal
+def garman_klass_volatility(open_p, high_p, low_p, close_p, window=20):
+    log_hl = np.log(high_p / low_p)
+    log_co = np.log(close_p / open_p)
+    rs = 0.5 * log_hl**2 - (2 * np.log(2) - 1) * log_co**2
+    return np.sqrt(rs.rolling(window=window).mean())
+
+def rolling_hurst_exponent(series, window=60):
+    def hurst(ts):
+        lags = range(2, 20)
+        tau = [np.sqrt(np.std(np.subtract(ts[lag:], ts[:-lag]))) for lag in lags]
+        poly = np.polyfit(np.log(lags), np.log(tau), 1)
+        return poly[0] * 2.0
+    return series.rolling(window).apply(hurst, raw=True)
+
+def fractional_diff(series, d=0.4, thres=0.01):
+    w = [1.]
+    for k in range(1, len(series)):
+        w_k = -w[-1] / k * (d - k + 1)
+        w.append(w_k)
+    w = np.array(w)
+    w_valid = w[np.abs(w) > thres]
+    w_len = len(w_valid)
+    w_valid = w_valid[::-1]
+    res = np.full_like(series, np.nan, dtype=float)
+    prices = series.values
+    for i in range(w_len - 1, len(series)):
+        res[i] = np.dot(w_valid, prices[i - w_len + 1 : i + 1])
+    return pd.Series(res, index=series.index)
 
 def calculate_atr(high, low, close, period=14):
     tr1 = high - low
@@ -295,18 +329,17 @@ def define_features(df):
     X['vol_20'] = ret.shift(1).rolling(20).std()
     X['vol_ratio'] = X['vol_5'] / (X['vol_20'] + 1e-8)
 
-    X['rsi_14'] = calculate_rsi(close, 14)
-    X['rsi_9'] = calculate_rsi(close, 9)
-    macd, signal, hist = calculate_macd(close)
-    X['macd'] = macd
-    X['macd_hist'] = hist
-    X['macd_pos'] = np.where(hist > 0, 1, 0)
-
-    X['ema_9'] = close.ewm(span=9, adjust=False).mean()
-    X['ema_21'] = close.ewm(span=21, adjust=False).mean()
-    X['ema_50'] = close.ewm(span=50, adjust=False).mean()
-    X['trend_9_21'] = np.where(X['ema_9'] > X['ema_21'], 1, 0)
-    X['trend_strength'] = X['trend_9_21'] + np.where(X['ema_21'] > X['ema_50'], 1, 0)
+    X['kalman_trend'] = kalman_filter_trend(close)
+    X['kalman_dist'] = (close - X['kalman_trend']) / (X['kalman_trend'] + 1e-8)
+    
+    X['gk_vol'] = garman_klass_volatility(open_, high, low, close, 20)
+    
+    X['frac_diff_close'] = fractional_diff(close, d=0.4)
+    X['frac_diff_vol'] = fractional_diff(volume, d=0.4)
+    
+    # Hurst takes a long time, we'll subsample or just use a small window if needed
+    # We'll use window=30 to speed up
+    X['hurst_30'] = rolling_hurst_exponent(close, window=30)
 
     X['vol_sma_ratio'] = volume / (volume.rolling(20).mean() + 1e-8)
     X['high_vol'] = np.where(X['vol_sma_ratio'] > 1.5, 1, 0)
