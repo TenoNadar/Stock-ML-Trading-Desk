@@ -38,7 +38,7 @@ MIN_TRADES = 3
 TRAIN_RATIO = 0.7
 MIN_WEIGHTED_RETURN = 0.006   # min 0.6% volume+time weighted forward return
 MAX_FORWARD_DD = 0.035        # max 3.5% adverse move in forward window
-CHASE_FILTER = 0.05           # skip entry if prior day moved > 5%
+CHASE_FILTER = 0.025          # skip entry if prior day moved > 2.5%
 
 # Try yfinance (if installed)
 try:
@@ -198,18 +198,14 @@ for symbol, name, cap in _RAW_STOCKS:
 # ═══════════════════════════════════════════════════════════════
 
 def fetch_stock_data(symbol):
-    """Fetch real Yahoo Finance data"""
+    """Fetch data from local cache"""
     if not USE_REAL_DATA:
         return None
     try:
-        df = yf.download(symbol, period="2y", progress=False, auto_adjust=True)
+        df = pd.read_csv(f"cache/{symbol}.csv")
         if df is None or df.empty:
             return None
-        df = df.reset_index()
-        # Flatten MultiIndex columns from newer yfinance versions
-        if isinstance(df.columns, pd.MultiIndex):
-            df.columns = [col[0] if isinstance(col, tuple) else col for col in df.columns]
-        df.columns = [str(c).strip() for c in df.columns]
+            
         rename_map = {
             "Datetime": "Date",
             "Date": "Date",
@@ -220,6 +216,7 @@ def fetch_stock_data(symbol):
             "Volume": "Volume",
         }
         df = df.rename(columns=rename_map)
+        df['Date'] = pd.to_datetime(df['Date'])
         required = ["Date", "Open", "High", "Low", "Close", "Volume"]
         missing = [col for col in required if col not in df.columns]
         if missing:
@@ -227,7 +224,7 @@ def fetch_stock_data(symbol):
             return None
         return df[required].dropna()
     except Exception as e:
-        print(f"    ❌ Error fetching {symbol}: {str(e)[:40]}")
+        print(f"    ❌ Error reading cache for {symbol}: {str(e)[:40]}")
         return None
 
 def generate_simulated_data(symbol, base_price=1500):
@@ -546,7 +543,7 @@ def backtest_long_signals(probas, df_clean, start_idx, horizon, threshold=PREDIC
                 continue
         entry = float(close_arr[i])
 
-        # Compute ATR at entry (14-period) for point-in-time SL/target
+        # Compute ATR at entry (14-period) for point-in-time bounds and SL/target
         atr_start = max(1, i - 13)
         trs = []
         for j in range(atr_start, i + 1):
@@ -557,10 +554,17 @@ def backtest_long_signals(probas, df_clean, start_idx, horizon, threshold=PREDIC
             )
             trs.append(tr)
         atr = float(np.mean(trs)) if trs else entry * 0.02
+        
+        # Statistical Valid Opening Range
+        min_open = entry - (0.5 * atr)
+        max_open = entry + (0.5 * atr)
+        
+        actual_entry = float(open_arr[i + 1])
+        if actual_entry < min_open or actual_entry > max_open:
+            continue
 
-        hold_scale = horizon / 5.0
-        sl_price = entry - 2.2 * atr
-        t1_price = entry + 1.3 * atr * hold_scale
+        sl_price = actual_entry - 1.5 * atr
+        t1_price = actual_entry + 1.5 * atr
 
         # Walk through holding period: check SL/target intra-trade
         actual_exit = float(close_arr[i + horizon])
@@ -569,6 +573,8 @@ def backtest_long_signals(probas, df_clean, start_idx, horizon, threshold=PREDIC
             day_open = float(open_arr[i + k])
             day_low = float(low_arr[i + k])
             day_high = float(high_arr[i + k])
+            
+            # SL hit
             if day_open <= sl_price:
                 actual_exit = day_open
                 exit_reason = 'sl'
@@ -577,8 +583,10 @@ def backtest_long_signals(probas, df_clean, start_idx, horizon, threshold=PREDIC
                 actual_exit = sl_price
                 exit_reason = 'sl'
                 break
+                
+            # Target hit
             if day_open >= t1_price:
-                actual_exit = t1_price
+                actual_exit = day_open
                 exit_reason = 'target'
                 break
             if day_high >= t1_price:
@@ -586,15 +594,15 @@ def backtest_long_signals(probas, df_clean, start_idx, horizon, threshold=PREDIC
                 exit_reason = 'target'
                 break
 
-        pnl_pct = (actual_exit - entry) / entry * 100
+        pnl_pct = (actual_exit - actual_entry) / actual_entry * 100
 
         entry_date = ''
         if dates_arr is not None:
-            entry_date = str(pd.to_datetime(dates_arr[i]).date())
+            entry_date = str(pd.to_datetime(dates_arr[i + 1]).date())
 
         trade_records.append({
             'd': entry_date,
-            'ep': round(entry, 2),
+            'ep': round(actual_entry, 2),
             'xp': round(actual_exit, 2),
             'sl': round(sl_price, 2),
             't1': round(t1_price, 2),
@@ -908,7 +916,7 @@ def result_for_model(stock, model_name):
     }
 
 def portfolio_backtest(stocks_test_data, model_name,
-                       threshold=PREDICTION_THRESHOLD, max_positions=5, notional=10000, sl_mult=2.2, t1_mult=1.3):
+                       threshold=PREDICTION_THRESHOLD, max_positions=5, notional=10000, sl_mult=1.5, t1_mult=3.0):
     """Cross-sectional point-in-time portfolio backtest — no look-ahead bias.
 
     Walks every trading day across the test set, picks top stocks by
@@ -967,7 +975,7 @@ def portfolio_backtest(stocks_test_data, model_name,
                 exit_price, exit_reason = day_open, 'target'
             elif day_high >= pos['t1']:
                 exit_price, exit_reason = pos['t1'], 'target'
-            elif pos['days_held'] >= lu['horizon']:
+            elif pos['days_held'] >= pos.get('horizon', lu['horizon']):
                 exit_price, exit_reason = day_close, 'hold'
 
             if exit_price is not None:
@@ -1003,7 +1011,6 @@ def portfolio_backtest(stocks_test_data, model_name,
             if idx + 1 >= len(lu['close']):
                 continue
                 
-            entry_price = float(lu['open'][idx + 1])
             prev_close = float(lu['close'][idx])
             
             # Anti-chase filter (avoid buying after a spike)
@@ -1012,19 +1019,14 @@ def portfolio_backtest(stocks_test_data, model_name,
                 if prior_close > 0 and (prev_close - prior_close) / prior_close > CHASE_FILTER:
                     continue
                     
-            # 1. Gap Risk Block: Reject if next day gaps down > 1.5%
-            if prev_close > 0:
-                gap = (entry_price / prev_close) - 1
-                if gap < -0.015:
-                    continue
-                    
-            # 2. Volume Exhaustion Block: Reject if volume < 0.8 * SMA20
+            # Volume Exhaustion Block: Reject if volume < 0.8 * SMA20 or > 2.0 * SMA20 (blow-off top)
             if len(lu['volume']) > idx and len(lu['vol_sma20']) > idx:
                 vol_sma = float(lu['vol_sma20'][idx])
-                if vol_sma > 0 and float(lu['volume'][idx]) < 0.8 * vol_sma:
+                vol_val = float(lu['volume'][idx])
+                if vol_sma > 0 and (vol_val < 0.8 * vol_sma or vol_val > 2.0 * vol_sma):
                     continue
                     
-            # 3. Volatility Ceiling Block: Reject if daily volatility > 5%
+            # Volatility Ceiling Block: Reject if daily volatility > 5%
             atr_val = float(lu['atr'][idx])
             if prev_close > 0 and (atr_val / prev_close) > 0.05:
                 continue
@@ -1033,25 +1035,41 @@ def portfolio_backtest(stocks_test_data, model_name,
 
         if not candidates:
             continue
+            
         candidates.sort(key=lambda x: x[1], reverse=True)
+        
+        # Execute only top candidates that open within the statistical boundary
         for sym, prob, idx in candidates[:max_positions]:
             lu = stock_lookup[sym]
             entry_price = float(lu['open'][idx + 1])
+            prev_close = float(lu['close'][idx])
             atr_val = float(lu['atr'][idx])
+            
             if atr_val <= 0 or entry_price <= 0:
                 continue
-            horizon = lu['horizon']
+                
+            # Statistical Valid Opening Range: +/- 0.5 ATR
+            min_open = prev_close - (0.5 * atr_val)
+            max_open = prev_close + (0.5 * atr_val)
+            
+            # If Open[t+1] falls outside the valid range, abort the trade.
+            # No backfilling occurs to prevent lookahead bias in ranking.
+            if entry_price < min_open or entry_price > max_open:
+                continue
+                
+            horizon = max(15, lu['horizon']) # Increased minimum holding period to 15 days
             shares = int(notional // entry_price)
             if shares <= 0:
                 continue
-            hold_scale = horizon / 5.0
+                
             open_positions[sym] = {
                 'entry_date': lu['dates'][idx + 1],
                 'entry_price': entry_price,
                 'sl': entry_price - sl_mult * atr_val,
-                't1': entry_price + t1_mult * atr_val * hold_scale,
+                't1': entry_price + t1_mult * atr_val,
                 'shares': shares,
                 'days_held': 0,
+                'horizon': horizon,
             }
 
     return trade_log
@@ -1092,26 +1110,26 @@ if __name__ == '__main__':
     print("\n" + "="*100)
     print("OPTIMIZING ATR MULTIPLIERS (GRID SEARCH ON LightGBM)")
     print("="*100)
-    sl_mults = [1.0, 1.2, 1.5, 1.8, 2.0, 2.2]
-    t1_mults = [1.0, 1.3, 1.5, 1.8, 2.0, 2.5, 3.0]
+    # Grid search specifically using LightGBM for speed
+    sl_mults = [1.0, 1.25, 1.5, 1.75, 2.0, 2.25, 2.5]
     
-    best_sl = 2.2
-    best_t1 = 1.3
+    best_sl = 1.5
+    best_t1 = 3.0
     best_pnl = -float('inf')
     
     for sl in sl_mults:
-        for t1 in t1_mults:
-            tlog = portfolio_backtest(stocks_test_data, 'lightgbm', sl_mult=sl, t1_mult=t1)
-            total_pnl = sum(t['pnl_rs'] for t in tlog)
-            wins = sum(1 for t in tlog if t['pnl_rs'] > 0)
-            trades = len(tlog)
-            wr = (wins / trades * 100) if trades > 0 else 0
+        t1 = sl * 2.0
+        tlog = portfolio_backtest(stocks_test_data, 'lightgbm', sl_mult=sl, t1_mult=t1)
+        total_pnl = sum(t['pnl_rs'] for t in tlog)
+        wins = sum(1 for t in tlog if t['pnl_rs'] > 0)
+        trades = len(tlog)
+        wr = (wins / trades * 100) if trades > 0 else 0
+        
+        if total_pnl > best_pnl:
+            best_pnl = total_pnl
+            best_sl = sl
+            best_t1 = t1
             
-            if total_pnl > best_pnl:
-                best_pnl = total_pnl
-                best_sl = sl
-                best_t1 = t1
-                
     print(f"  🏆 Optimal Multipliers Found: SL = {best_sl}x ATR | T1 = {best_t1}x ATR")
     print(f"  Projected Optimal PnL (LightGBM): ₹{best_pnl:,.0f}")
     
