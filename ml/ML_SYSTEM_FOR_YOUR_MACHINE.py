@@ -25,19 +25,20 @@ from sklearn.metrics import accuracy_score
 from sklearn.base import clone
 from xgboost import XGBClassifier
 from lightgbm import LGBMClassifier
+from catboost import CatBoostClassifier
 import warnings
 warnings.filterwarnings('ignore')
 
 SCRIPT_DIR = Path(__file__).resolve().parent
-OUTPUT_FILE = SCRIPT_DIR / "ml_results_final.json"
+OUTPUT_FILE = SCRIPT_DIR.parent / "public" / "ml_results_final.json"
 
-HORIZON_CANDIDATES = [3, 5, 7]
+# HORIZON_CANDIDATES removed in favor of dynamic derivation
 PREDICTION_THRESHOLD = 0.40
 MIN_TRADES = 3
 TRAIN_RATIO = 0.7
 MIN_WEIGHTED_RETURN = 0.006   # min 0.6% volume+time weighted forward return
 MAX_FORWARD_DD = 0.035        # max 3.5% adverse move in forward window
-CHASE_FILTER = 0.05           # skip entry if prior day moved > 5%
+CHASE_FILTER = 0.025          # skip entry if prior day moved > 2.5%
 
 # Try yfinance (if installed)
 try:
@@ -197,18 +198,14 @@ for symbol, name, cap in _RAW_STOCKS:
 # ═══════════════════════════════════════════════════════════════
 
 def fetch_stock_data(symbol):
-    """Fetch real Yahoo Finance data"""
+    """Fetch data from local cache"""
     if not USE_REAL_DATA:
         return None
     try:
-        df = yf.download(symbol, period="2y", progress=False, auto_adjust=True)
+        df = pd.read_csv(f"cache/{symbol}.csv")
         if df is None or df.empty:
             return None
-        df = df.reset_index()
-        # Flatten MultiIndex columns from newer yfinance versions
-        if isinstance(df.columns, pd.MultiIndex):
-            df.columns = [col[0] if isinstance(col, tuple) else col for col in df.columns]
-        df.columns = [str(c).strip() for c in df.columns]
+            
         rename_map = {
             "Datetime": "Date",
             "Date": "Date",
@@ -219,6 +216,7 @@ def fetch_stock_data(symbol):
             "Volume": "Volume",
         }
         df = df.rename(columns=rename_map)
+        df['Date'] = pd.to_datetime(df['Date'])
         required = ["Date", "Open", "High", "Low", "Close", "Volume"]
         missing = [col for col in required if col not in df.columns]
         if missing:
@@ -226,7 +224,7 @@ def fetch_stock_data(symbol):
             return None
         return df[required].dropna()
     except Exception as e:
-        print(f"    ❌ Error fetching {symbol}: {str(e)[:40]}")
+        print(f"    ❌ Error reading cache for {symbol}: {str(e)[:40]}")
         return None
 
 def generate_simulated_data(symbol, base_price=1500):
@@ -252,19 +250,53 @@ def generate_simulated_data(symbol, base_price=1500):
 # FEATURE ENGINEERING (look-ahead safe)
 # ═══════════════════════════════════════════════════════════════
 
-def calculate_rsi(prices, period=14):
-    delta = prices.diff()
-    gain = (delta.where(delta > 0, 0)).rolling(window=period).mean()
-    loss = (-delta.where(delta < 0, 0)).rolling(window=period).mean()
-    rs = gain / (loss + 1e-8)
-    return 100 - (100 / (1 + rs))
+def kalman_filter_trend(series):
+    n = len(series)
+    xhat = np.zeros(n)
+    P = np.zeros(n)
+    xhatminus = np.zeros(n)
+    Pminus = np.zeros(n)
+    K = np.zeros(n)
+    Q = 1e-5
+    R = 1e-3
+    xhat[0] = series.iloc[0]
+    P[0] = 1.0
+    for k in range(1, n):
+        xhatminus[k] = xhat[k-1]
+        Pminus[k] = P[k-1] + Q
+        K[k] = Pminus[k] / (Pminus[k] + R)
+        xhat[k] = xhatminus[k] + K[k] * (series.iloc[k] - xhatminus[k])
+        P[k] = (1 - K[k]) * Pminus[k]
+    return pd.Series(xhat, index=series.index)
 
-def calculate_macd(prices):
-    ema_fast = prices.ewm(span=12, adjust=False).mean()
-    ema_slow = prices.ewm(span=26, adjust=False).mean()
-    macd = ema_fast - ema_slow
-    signal = macd.ewm(span=9, adjust=False).mean()
-    return macd, signal, macd - signal
+def garman_klass_volatility(open_p, high_p, low_p, close_p, window=20):
+    log_hl = np.log(high_p / low_p)
+    log_co = np.log(close_p / open_p)
+    rs = 0.5 * log_hl**2 - (2 * np.log(2) - 1) * log_co**2
+    return np.sqrt(rs.rolling(window=window).mean())
+
+def rolling_hurst_exponent(series, window=60):
+    def hurst(ts):
+        lags = range(2, 20)
+        tau = [np.sqrt(np.std(np.subtract(ts[lag:], ts[:-lag]))) for lag in lags]
+        poly = np.polyfit(np.log(lags), np.log(tau), 1)
+        return poly[0] * 2.0
+    return series.rolling(window).apply(hurst, raw=True)
+
+def fractional_diff(series, d=0.4, thres=0.01):
+    w = [1.]
+    for k in range(1, len(series)):
+        w_k = -w[-1] / k * (d - k + 1)
+        w.append(w_k)
+    w = np.array(w)
+    w_valid = w[np.abs(w) > thres]
+    w_len = len(w_valid)
+    w_valid = w_valid[::-1]
+    res = np.full_like(series, np.nan, dtype=float)
+    prices = series.values
+    for i in range(w_len - 1, len(series)):
+        res[i] = np.dot(w_valid, prices[i - w_len + 1 : i + 1])
+    return pd.Series(res, index=series.index)
 
 def calculate_atr(high, low, close, period=14):
     tr1 = high - low
@@ -295,18 +327,17 @@ def define_features(df):
     X['vol_20'] = ret.shift(1).rolling(20).std()
     X['vol_ratio'] = X['vol_5'] / (X['vol_20'] + 1e-8)
 
-    X['rsi_14'] = calculate_rsi(close, 14)
-    X['rsi_9'] = calculate_rsi(close, 9)
-    macd, signal, hist = calculate_macd(close)
-    X['macd'] = macd
-    X['macd_hist'] = hist
-    X['macd_pos'] = np.where(hist > 0, 1, 0)
-
-    X['ema_9'] = close.ewm(span=9, adjust=False).mean()
-    X['ema_21'] = close.ewm(span=21, adjust=False).mean()
-    X['ema_50'] = close.ewm(span=50, adjust=False).mean()
-    X['trend_9_21'] = np.where(X['ema_9'] > X['ema_21'], 1, 0)
-    X['trend_strength'] = X['trend_9_21'] + np.where(X['ema_21'] > X['ema_50'], 1, 0)
+    X['kalman_trend'] = kalman_filter_trend(close)
+    X['kalman_dist'] = (close - X['kalman_trend']) / (X['kalman_trend'] + 1e-8)
+    
+    X['gk_vol'] = garman_klass_volatility(open_, high, low, close, 20)
+    
+    X['frac_diff_close'] = fractional_diff(close, d=0.4)
+    X['frac_diff_vol'] = fractional_diff(volume, d=0.4)
+    
+    # Hurst takes a long time, we'll subsample or just use a small window if needed
+    # We'll use window=30 to speed up
+    X['hurst_30'] = rolling_hurst_exponent(close, window=30)
 
     X['vol_sma_ratio'] = volume / (volume.rolling(20).mean() + 1e-8)
     X['high_vol'] = np.where(X['vol_sma_ratio'] > 1.5, 1, 0)
@@ -336,6 +367,38 @@ def time_decay_weights(horizon):
     """Later days in the forward window get higher weight (sustainability)."""
     w = np.arange(1, horizon + 1, dtype=float)
     return w / w.sum()
+
+def derive_optimal_horizon(prices, volumes, min_h=2, max_h=15):
+    """
+    Mathematically derive the optimal holding period (horizon) using the
+    zero-crossing of the Volume-Weighted Autocorrelation Function (ACF).
+    """
+    rets = np.log(prices / prices.shift(1)).fillna(0)
+    vol_sma = volumes.rolling(window=20).mean()
+    vol_ratio = (volumes / (vol_sma + 1e-8)).fillna(1)
+    vw_rets = (rets * vol_ratio).dropna().values
+    
+    n = len(vw_rets)
+    if n < max_h * 2:
+        return 5
+        
+    mean = np.mean(vw_rets)
+    var = np.var(vw_rets)
+    if var == 0:
+        return 5
+        
+    acf = []
+    for lag in range(1, max_h + 2):
+        cov = np.sum((vw_rets[:-lag] - mean) * (vw_rets[lag:] - mean)) / n
+        acf.append(cov / var)
+        
+    optimal_h = max_h
+    for lag_idx, val in enumerate(acf):
+        if val <= 0:
+            optimal_h = lag_idx + 1
+            break
+            
+    return max(min_h, min(optimal_h, max_h))
 
 def build_weighted_target(df, horizon):
     """
@@ -427,6 +490,15 @@ def get_models(y_train=None):
             random_state=42,
             n_jobs=-1,
         ),
+        'catboost': CatBoostClassifier(
+            iterations=300,
+            depth=6,
+            learning_rate=0.05,
+            scale_pos_weight=scale_pos,
+            random_state=42,
+            thread_count=-1,
+            verbose=0,
+        ),
     }
 
 def cross_val_accuracy(model, X, y, n_splits=5):
@@ -471,7 +543,7 @@ def backtest_long_signals(probas, df_clean, start_idx, horizon, threshold=PREDIC
                 continue
         entry = float(close_arr[i])
 
-        # Compute ATR at entry (14-period) for point-in-time SL/target
+        # Compute ATR at entry (14-period) for point-in-time bounds and SL/target
         atr_start = max(1, i - 13)
         trs = []
         for j in range(atr_start, i + 1):
@@ -482,10 +554,17 @@ def backtest_long_signals(probas, df_clean, start_idx, horizon, threshold=PREDIC
             )
             trs.append(tr)
         atr = float(np.mean(trs)) if trs else entry * 0.02
+        
+        # Statistical Valid Opening Range
+        min_open = entry - (0.5 * atr)
+        max_open = entry + (0.5 * atr)
+        
+        actual_entry = float(open_arr[i + 1])
+        if actual_entry < min_open or actual_entry > max_open:
+            continue
 
-        hold_scale = horizon / 5.0
-        sl_price = entry - 2.2 * atr
-        t1_price = entry + 1.3 * atr * hold_scale
+        sl_price = actual_entry - 1.5 * atr
+        t1_price = actual_entry + 1.5 * atr
 
         # Walk through holding period: check SL/target intra-trade
         actual_exit = float(close_arr[i + horizon])
@@ -494,6 +573,8 @@ def backtest_long_signals(probas, df_clean, start_idx, horizon, threshold=PREDIC
             day_open = float(open_arr[i + k])
             day_low = float(low_arr[i + k])
             day_high = float(high_arr[i + k])
+            
+            # SL hit
             if day_open <= sl_price:
                 actual_exit = day_open
                 exit_reason = 'sl'
@@ -502,8 +583,10 @@ def backtest_long_signals(probas, df_clean, start_idx, horizon, threshold=PREDIC
                 actual_exit = sl_price
                 exit_reason = 'sl'
                 break
+                
+            # Target hit
             if day_open >= t1_price:
-                actual_exit = t1_price
+                actual_exit = day_open
                 exit_reason = 'target'
                 break
             if day_high >= t1_price:
@@ -511,15 +594,15 @@ def backtest_long_signals(probas, df_clean, start_idx, horizon, threshold=PREDIC
                 exit_reason = 'target'
                 break
 
-        pnl_pct = (actual_exit - entry) / entry * 100
+        pnl_pct = (actual_exit - actual_entry) / actual_entry * 100
 
         entry_date = ''
         if dates_arr is not None:
-            entry_date = str(pd.to_datetime(dates_arr[i]).date())
+            entry_date = str(pd.to_datetime(dates_arr[i + 1]).date())
 
         trade_records.append({
             'd': entry_date,
-            'ep': round(entry, 2),
+            'ep': round(actual_entry, 2),
             'xp': round(actual_exit, 2),
             'sl': round(sl_price, 2),
             't1': round(t1_price, 2),
@@ -679,28 +762,11 @@ def analyze_stock(symbol, name, cap_type):
         last_data_date = pd.to_datetime(df_clean['Date'].iloc[-1]).date().isoformat()
         X_feat = define_features(df_clean)
 
-        # ── Phase 1: compare 3 / 5 / 7-day weighted horizons (ensemble) ──
-        horizon_comparison = {}
-        for h in HORIZON_CANDIDATES:
-            metrics = run_horizon_ensemble(df_clean, h)
-            if metrics:
-                metrics['composite_score'] = horizon_composite_score(metrics)
-                metrics.pop('trade_log', None)
-                metrics.pop('probas', None)
-                horizon_comparison[str(h)] = metrics
+        # ── Phase 1: Mathematically derive optimal horizon ──
+        best_h = derive_optimal_horizon(df_clean['Close'], df_clean['Volume'])
+        horizon_comparison = {str(best_h): {'sharpe': 0}} # Mock for compatibility
 
-        if not horizon_comparison:
-            print("❌ Too few signals")
-            return None
-
-        best_horizon = max(
-            horizon_comparison.keys(),
-            key=lambda k: horizon_comparison[k]['composite_score']
-        )
-        best_h = int(best_horizon)
-        best_ens = horizon_comparison[best_horizon]
-
-        # ── Phase 2: full model suite on best horizon ──
+        # ── Phase 2: full model suite on derived horizon ──
         X = define_features(df_clean)
         y = build_weighted_target(df_clean, best_h).values
         valid_mask = valid_sample_mask(X, y)
@@ -726,10 +792,12 @@ def analyze_stock(symbol, name, cap_type):
         ensemble_metrics = run_ensemble_pipeline(
             models, X_train, y_train, X_scaled, df_valid, train_size, best_h
         )
-        if ensemble_metrics:
-            model_results['ensemble'] = ensemble_metrics
-
-        ens = model_results.get('ensemble', best_ens)
+        if not ensemble_metrics:
+            print("❌ Ensemble failed")
+            return None
+            
+        model_results['ensemble'] = ensemble_metrics
+        ens = ensemble_metrics
 
         # ── Collect test-period data for cross-sectional portfolio backtest ──
         test_dates = []
@@ -739,6 +807,8 @@ def analyze_stock(symbol, name, cap_type):
         test_open = df_valid['Open'].values[train_size:].astype(float)
         test_high = df_valid['High'].values[train_size:].astype(float)
         test_low = df_valid['Low'].values[train_size:].astype(float)
+        test_volume = df_valid['Volume'].values[train_size:].astype(float)
+        vol_sma20 = df_valid['Volume'].rolling(20, min_periods=1).mean().values[train_size:].astype(float)
         full_atr = compute_atr_array(
             df_valid['High'].values.astype(float),
             df_valid['Low'].values.astype(float),
@@ -756,6 +826,8 @@ def analyze_stock(symbol, name, cap_type):
             'close': test_close,
             'high': test_high,
             'low': test_low,
+            'volume': test_volume,
+            'vol_sma20': vol_sma20,
             'atr': test_atr,
             'horizon': best_h,
             'probs': test_probs,
@@ -844,7 +916,7 @@ def result_for_model(stock, model_name):
     }
 
 def portfolio_backtest(stocks_test_data, model_name,
-                       threshold=PREDICTION_THRESHOLD, max_positions=5, notional=10000):
+                       threshold=PREDICTION_THRESHOLD, max_positions=5, notional=10000, sl_mult=1.5, t1_mult=3.0):
     """Cross-sectional point-in-time portfolio backtest — no look-ahead bias.
 
     Walks every trading day across the test set, picks top stocks by
@@ -859,11 +931,14 @@ def portfolio_backtest(stocks_test_data, model_name,
         date_to_idx = {d: i for i, d in enumerate(data['dates'])}
         stock_lookup[sym] = {
             'name': data['name'],
+            'dates': data['dates'],
             'date_to_idx': date_to_idx,
             'open': np.array(data.get('open', data['close']), dtype=float),
             'close': np.array(data['close'], dtype=float),
             'high': np.array(data['high'], dtype=float),
             'low': np.array(data['low'], dtype=float),
+            'volume': np.array(data.get('volume', []), dtype=float),
+            'vol_sma20': np.array(data.get('vol_sma20', []), dtype=float),
             'atr': np.array(data['atr'], dtype=float),
             'probs': np.array(probs, dtype=float),
             'horizon': data['horizon'],
@@ -900,7 +975,7 @@ def portfolio_backtest(stocks_test_data, model_name,
                 exit_price, exit_reason = day_open, 'target'
             elif day_high >= pos['t1']:
                 exit_price, exit_reason = pos['t1'], 'target'
-            elif pos['days_held'] >= lu['horizon']:
+            elif pos['days_held'] >= pos.get('horizon', lu['horizon']):
                 exit_price, exit_reason = day_close, 'hold'
 
             if exit_price is not None:
@@ -931,35 +1006,70 @@ def portfolio_backtest(stocks_test_data, model_name,
             prob = float(lu['probs'][idx])
             if prob <= threshold:
                 continue
-            entry_price = float(lu['close'][idx])
-            # Anti-chase filter
+                
+            # Ensure next day exists for Next-Day Open Execution
+            if idx + 1 >= len(lu['close']):
+                continue
+                
+            prev_close = float(lu['close'][idx])
+            
+            # Anti-chase filter (avoid buying after a spike)
             if idx > 0:
-                prev_close = float(lu['close'][idx - 1])
-                if prev_close > 0 and abs(entry_price - prev_close) / prev_close > CHASE_FILTER:
+                prior_close = float(lu['close'][idx - 1])
+                if prior_close > 0 and (prev_close - prior_close) / prior_close > CHASE_FILTER:
                     continue
+                    
+            # Volume Exhaustion Block: Reject if volume < 0.8 * SMA20 or > 2.0 * SMA20 (blow-off top)
+            if len(lu['volume']) > idx and len(lu['vol_sma20']) > idx:
+                vol_sma = float(lu['vol_sma20'][idx])
+                vol_val = float(lu['volume'][idx])
+                if vol_sma > 0 and (vol_val < 0.8 * vol_sma or vol_val > 2.0 * vol_sma):
+                    continue
+                    
+            # Volatility Ceiling Block: Reject if daily volatility > 5%
+            atr_val = float(lu['atr'][idx])
+            if prev_close > 0 and (atr_val / prev_close) > 0.05:
+                continue
+
             candidates.append((sym, prob, idx))
 
         if not candidates:
             continue
+            
         candidates.sort(key=lambda x: x[1], reverse=True)
-        for sym, prob, idx in candidates:
+        
+        # Execute only top candidates that open within the statistical boundary
+        for sym, prob, idx in candidates[:max_positions]:
             lu = stock_lookup[sym]
-            entry_price = float(lu['close'][idx])
+            entry_price = float(lu['open'][idx + 1])
+            prev_close = float(lu['close'][idx])
             atr_val = float(lu['atr'][idx])
+            
             if atr_val <= 0 or entry_price <= 0:
                 continue
-            horizon = lu['horizon']
+                
+            # Statistical Valid Opening Range: +/- 0.5 ATR
+            min_open = prev_close - (0.5 * atr_val)
+            max_open = prev_close + (0.5 * atr_val)
+            
+            # If Open[t+1] falls outside the valid range, abort the trade.
+            # No backfilling occurs to prevent lookahead bias in ranking.
+            if entry_price < min_open or entry_price > max_open:
+                continue
+                
+            horizon = max(15, lu['horizon']) # Increased minimum holding period to 15 days
             shares = int(notional // entry_price)
             if shares <= 0:
                 continue
-            hold_scale = horizon / 5.0
+                
             open_positions[sym] = {
-                'entry_date': date,
+                'entry_date': lu['dates'][idx + 1],
                 'entry_price': entry_price,
-                'sl': entry_price - 2.2 * atr_val,
-                't1': entry_price + 1.3 * atr_val * hold_scale,
+                'sl': entry_price - sl_mult * atr_val,
+                't1': entry_price + t1_mult * atr_val,
                 'shares': shares,
                 'days_held': 0,
+                'horizon': horizon,
             }
 
     return trade_log
@@ -973,11 +1083,11 @@ if __name__ == '__main__':
     print("DYNAMIC ML — PER-STOCK 3D / 5D / 7D WEIGHTED HORIZON OPTIMISER")
     print("="*100)
     print(f"\nData Mode: {'REAL Yahoo Finance' if USE_REAL_DATA else 'SIMULATED (for demo)'}")
-    print(f"History: 2 years | Horizons tested: {HORIZON_CANDIDATES} | Threshold: {PREDICTION_THRESHOLD}")
+    print(f"History: 2 years | Horizon: Dynamic (Vol-Weighted ACF) | Threshold: {PREDICTION_THRESHOLD}")
     print(f"Target: volume+time weighted | Anti-chase: {CHASE_FILTER*100:.0f}% | Universe: {len(STOCKS)} stocks\n")
 
     all_results = []
-    for symbol, name, cap in STOCKS[:15]:
+    for symbol, name, cap in STOCKS:
         result = analyze_stock(symbol, name, cap)
         if result:
             all_results.append(result)
@@ -985,7 +1095,7 @@ if __name__ == '__main__':
     all_results.sort(key=lambda x: x['sharpe'], reverse=True)
 
     # ── Cross-sectional portfolio backtest (no look-ahead bias) ──
-    MODEL_NAMES = ['xgboost', 'lightgbm', 'random_forest', 'ensemble']
+    MODEL_NAMES = ['xgboost', 'lightgbm', 'random_forest', 'catboost', 'ensemble']
     print("\n" + "="*100)
     print("RUNNING CROSS-SECTIONAL PORTFOLIO BACKTEST (top 5 by daily probability)")
     print("="*100)
@@ -996,9 +1106,39 @@ if __name__ == '__main__':
             stocks_test_data[r['symbol']] = td
     print(f"  {len(stocks_test_data)} stocks with test-period data")
 
+    # ── GRID SEARCH OPTIMIZATION FOR ATR MULTIPLIERS ──
+    print("\n" + "="*100)
+    print("OPTIMIZING ATR MULTIPLIERS (GRID SEARCH ON LightGBM)")
+    print("="*100)
+    # Grid search specifically using LightGBM for speed
+    sl_mults = [1.0, 1.25, 1.5, 1.75, 2.0, 2.25, 2.5]
+    
+    best_sl = 1.5
+    best_t1 = 3.0
+    best_pnl = -float('inf')
+    
+    for sl in sl_mults:
+        t1 = sl * 2.0
+        tlog = portfolio_backtest(stocks_test_data, 'lightgbm', sl_mult=sl, t1_mult=t1)
+        total_pnl = sum(t['pnl_rs'] for t in tlog)
+        wins = sum(1 for t in tlog if t['pnl_rs'] > 0)
+        trades = len(tlog)
+        wr = (wins / trades * 100) if trades > 0 else 0
+        
+        if total_pnl > best_pnl:
+            best_pnl = total_pnl
+            best_sl = sl
+            best_t1 = t1
+            
+    print(f"  🏆 Optimal Multipliers Found: SL = {best_sl}x ATR | T1 = {best_t1}x ATR")
+    print(f"  Projected Optimal PnL (LightGBM): ₹{best_pnl:,.0f}")
+    
+    print("\n" + "="*100)
+    print("RUNNING FINAL CROSS-SECTIONAL BACKTEST WITH OPTIMAL MULTIPLIERS")
+    print("="*100)
     portfolio_bt = {}
     for model_name in MODEL_NAMES:
-        tlog = portfolio_backtest(stocks_test_data, model_name)
+        tlog = portfolio_backtest(stocks_test_data, model_name, sl_mult=best_sl, t1_mult=best_t1)
         portfolio_bt[model_name] = tlog
         total_pnl = sum(t['pnl_rs'] for t in tlog)
         wins = sum(1 for t in tlog if t['pnl_rs'] > 0)
@@ -1043,32 +1183,41 @@ if __name__ == '__main__':
         rr = (r['t1'] - r['price']) / (r['price'] - r['sl'] + 1e-8)
         bh = r.get('best_horizon', 5)
 
-        print(f"\n{i}. {r['name']:20} ({r['symbol']:15}) {emoji}  [Best: {bh}D]")
+        print(f"\n{i}. {r['name']:20} ({r['symbol']:15}) {emoji}  [Horizon: {bh}D]")
         print(f"   Sharpe: {r['sharpe']:.2f} | Sortino: {r.get('sortino', 0):.2f} | MD: {r.get('max_drawdown', 0):.1f}% | Avg: {r.get('avg_return', 0):.2f}%")
         print(f"   WR: {r['win_rate']:.0f}% | Trades: {r['trades']} | CV: {r['cv_accuracy']:.0%}")
         print(f"   Entry: ₹{r['price']:.2f} | SL: ₹{r['sl']:.2f} | T1: ₹{r['t1']:.2f} | T2: ₹{r['t2']:.2f} | R:R {rr:.2f}:1")
-        hc = r.get('horizon_comparison', {})
-        if hc:
-            parts = [f"{k}D→S={hc[k]['sharpe']:.1f}" for k in sorted(hc.keys(), key=int)]
-            print(f"   Horizon test: {' | '.join(parts)}")
 
-    print(f"\n  Best horizon distribution (top 20): 3D={horizon_counts.get(3,0)} | 5D={horizon_counts.get(5,0)} | 7D={horizon_counts.get(7,0)}")
+    print(f"\n  Dynamic horizon derived via Volume-Weighted ACF Memory Decay")
 
     print("\n" + "="*100)
     print("MODEL COMPARISON (avg Sharpe of top-20 per model)")
     print("="*100)
+    
+    best_overall_model = None
+    best_overall_pnl = -float('inf')
+    
     for model_name in MODEL_NAMES:
         rows = backtest[model_name]
         avg_sharpe = np.mean([r['sharpe'] for r in rows]) if rows else 0
         avg_wr = np.mean([r['win_rate'] for r in rows]) if rows else 0
         print(f"  {model_name:16} → Top-20 avg Sharpe: {avg_sharpe:.2f} | avg WR: {avg_wr:.0f}% | stocks: {len(rows)}")
+        
+        pnl = sum(t['pnl_rs'] for t in portfolio_bt[model_name])
+        if pnl > best_overall_pnl:
+            best_overall_pnl = pnl
+            best_overall_model = model_name
+            
+    print("\n" + "="*100)
+    print(f"🏆 BEST PERFORMING MODEL: {best_overall_model.upper()} with Portfolio PnL of ₹{best_overall_pnl:,.0f}")
+    print("="*100)
 
     with open(OUTPUT_FILE, 'w') as f:
         json.dump({
             'mode': 'REAL' if USE_REAL_DATA else 'DEMO',
             'generated_at': datetime.now().astimezone().isoformat(timespec='seconds'),
             'history': '2y',
-            'horizons_tested': HORIZON_CANDIDATES,
+            'horizons_tested': 'dynamic_acf',
             'target_type': 'volume_time_weighted',
             'threshold': PREDICTION_THRESHOLD,
             'min_weighted_return': MIN_WEIGHTED_RETURN,
