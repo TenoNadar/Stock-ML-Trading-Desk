@@ -799,6 +799,8 @@ def analyze_stock(symbol, name, cap_type):
         test_open = df_valid['Open'].values[train_size:].astype(float)
         test_high = df_valid['High'].values[train_size:].astype(float)
         test_low = df_valid['Low'].values[train_size:].astype(float)
+        test_volume = df_valid['Volume'].values[train_size:].astype(float)
+        vol_sma20 = df_valid['Volume'].rolling(20, min_periods=1).mean().values[train_size:].astype(float)
         full_atr = compute_atr_array(
             df_valid['High'].values.astype(float),
             df_valid['Low'].values.astype(float),
@@ -816,6 +818,8 @@ def analyze_stock(symbol, name, cap_type):
             'close': test_close,
             'high': test_high,
             'low': test_low,
+            'volume': test_volume,
+            'vol_sma20': vol_sma20,
             'atr': test_atr,
             'horizon': best_h,
             'probs': test_probs,
@@ -919,11 +923,14 @@ def portfolio_backtest(stocks_test_data, model_name,
         date_to_idx = {d: i for i, d in enumerate(data['dates'])}
         stock_lookup[sym] = {
             'name': data['name'],
+            'dates': data['dates'],
             'date_to_idx': date_to_idx,
             'open': np.array(data.get('open', data['close']), dtype=float),
             'close': np.array(data['close'], dtype=float),
             'high': np.array(data['high'], dtype=float),
             'low': np.array(data['low'], dtype=float),
+            'volume': np.array(data.get('volume', []), dtype=float),
+            'vol_sma20': np.array(data.get('vol_sma20', []), dtype=float),
             'atr': np.array(data['atr'], dtype=float),
             'probs': np.array(probs, dtype=float),
             'horizon': data['horizon'],
@@ -991,20 +998,45 @@ def portfolio_backtest(stocks_test_data, model_name,
             prob = float(lu['probs'][idx])
             if prob <= threshold:
                 continue
-            entry_price = float(lu['close'][idx])
-            # Anti-chase filter
+                
+            # Ensure next day exists for Next-Day Open Execution
+            if idx + 1 >= len(lu['close']):
+                continue
+                
+            entry_price = float(lu['open'][idx + 1])
+            prev_close = float(lu['close'][idx])
+            
+            # Anti-chase filter (avoid buying after a spike)
             if idx > 0:
-                prev_close = float(lu['close'][idx - 1])
-                if prev_close > 0 and abs(entry_price - prev_close) / prev_close > CHASE_FILTER:
+                prior_close = float(lu['close'][idx - 1])
+                if prior_close > 0 and (prev_close - prior_close) / prior_close > CHASE_FILTER:
                     continue
+                    
+            # 1. Gap Risk Block: Reject if next day gaps down > 1.5%
+            if prev_close > 0:
+                gap = (entry_price / prev_close) - 1
+                if gap < -0.015:
+                    continue
+                    
+            # 2. Volume Exhaustion Block: Reject if volume < 0.8 * SMA20
+            if len(lu['volume']) > idx and len(lu['vol_sma20']) > idx:
+                vol_sma = float(lu['vol_sma20'][idx])
+                if vol_sma > 0 and float(lu['volume'][idx]) < 0.8 * vol_sma:
+                    continue
+                    
+            # 3. Volatility Ceiling Block: Reject if daily volatility > 5%
+            atr_val = float(lu['atr'][idx])
+            if prev_close > 0 and (atr_val / prev_close) > 0.05:
+                continue
+
             candidates.append((sym, prob, idx))
 
         if not candidates:
             continue
         candidates.sort(key=lambda x: x[1], reverse=True)
-        for sym, prob, idx in candidates:
+        for sym, prob, idx in candidates[:max_positions]:
             lu = stock_lookup[sym]
-            entry_price = float(lu['close'][idx])
+            entry_price = float(lu['open'][idx + 1])
             atr_val = float(lu['atr'][idx])
             if atr_val <= 0 or entry_price <= 0:
                 continue
@@ -1014,7 +1046,7 @@ def portfolio_backtest(stocks_test_data, model_name,
                 continue
             hold_scale = horizon / 5.0
             open_positions[sym] = {
-                'entry_date': date,
+                'entry_date': lu['dates'][idx + 1],
                 'entry_price': entry_price,
                 'sl': entry_price - 2.2 * atr_val,
                 't1': entry_price + 1.3 * atr_val * hold_scale,
