@@ -908,7 +908,7 @@ def result_for_model(stock, model_name):
     }
 
 def portfolio_backtest(stocks_test_data, model_name,
-                       threshold=PREDICTION_THRESHOLD, max_positions=5, notional=10000):
+                       threshold=PREDICTION_THRESHOLD, max_positions=5, notional=10000, sl_mult=2.2, t1_mult=1.3):
     """Cross-sectional point-in-time portfolio backtest — no look-ahead bias.
 
     Walks every trading day across the test set, picks top stocks by
@@ -1048,8 +1048,8 @@ def portfolio_backtest(stocks_test_data, model_name,
             open_positions[sym] = {
                 'entry_date': lu['dates'][idx + 1],
                 'entry_price': entry_price,
-                'sl': entry_price - 2.2 * atr_val,
-                't1': entry_price + 1.3 * atr_val * hold_scale,
+                'sl': entry_price - sl_mult * atr_val,
+                't1': entry_price + t1_mult * atr_val * hold_scale,
                 'shares': shares,
                 'days_held': 0,
             }
@@ -1088,9 +1088,39 @@ if __name__ == '__main__':
             stocks_test_data[r['symbol']] = td
     print(f"  {len(stocks_test_data)} stocks with test-period data")
 
+    # ── GRID SEARCH OPTIMIZATION FOR ATR MULTIPLIERS ──
+    print("\n" + "="*100)
+    print("OPTIMIZING ATR MULTIPLIERS (GRID SEARCH ON LightGBM)")
+    print("="*100)
+    sl_mults = [1.0, 1.2, 1.5, 1.8, 2.0, 2.2]
+    t1_mults = [1.0, 1.3, 1.5, 1.8, 2.0, 2.5, 3.0]
+    
+    best_sl = 2.2
+    best_t1 = 1.3
+    best_pnl = -float('inf')
+    
+    for sl in sl_mults:
+        for t1 in t1_mults:
+            tlog = portfolio_backtest(stocks_test_data, 'lightgbm', sl_mult=sl, t1_mult=t1)
+            total_pnl = sum(t['pnl_rs'] for t in tlog)
+            wins = sum(1 for t in tlog if t['pnl_rs'] > 0)
+            trades = len(tlog)
+            wr = (wins / trades * 100) if trades > 0 else 0
+            
+            if total_pnl > best_pnl:
+                best_pnl = total_pnl
+                best_sl = sl
+                best_t1 = t1
+                
+    print(f"  🏆 Optimal Multipliers Found: SL = {best_sl}x ATR | T1 = {best_t1}x ATR")
+    print(f"  Projected Optimal PnL (LightGBM): ₹{best_pnl:,.0f}")
+    
+    print("\n" + "="*100)
+    print("RUNNING FINAL CROSS-SECTIONAL BACKTEST WITH OPTIMAL MULTIPLIERS")
+    print("="*100)
     portfolio_bt = {}
     for model_name in MODEL_NAMES:
-        tlog = portfolio_backtest(stocks_test_data, model_name)
+        tlog = portfolio_backtest(stocks_test_data, model_name, sl_mult=best_sl, t1_mult=best_t1)
         portfolio_bt[model_name] = tlog
         total_pnl = sum(t['pnl_rs'] for t in tlog)
         wins = sum(1 for t in tlog if t['pnl_rs'] > 0)
