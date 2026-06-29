@@ -25,6 +25,7 @@ from sklearn.metrics import accuracy_score
 from sklearn.base import clone
 from xgboost import XGBClassifier
 from lightgbm import LGBMClassifier
+from catboost import CatBoostClassifier
 import warnings
 warnings.filterwarnings('ignore')
 
@@ -491,6 +492,15 @@ def get_models(y_train=None):
             class_weight='balanced',
             random_state=42,
             n_jobs=-1,
+        ),
+        'catboost': CatBoostClassifier(
+            iterations=300,
+            depth=6,
+            learning_rate=0.05,
+            scale_pos_weight=scale_pos,
+            random_state=42,
+            thread_count=-1,
+            verbose=0,
         ),
     }
 
@@ -1035,7 +1045,7 @@ if __name__ == '__main__':
     all_results.sort(key=lambda x: x['sharpe'], reverse=True)
 
     # ── Cross-sectional portfolio backtest (no look-ahead bias) ──
-    MODEL_NAMES = ['xgboost', 'lightgbm', 'random_forest', 'ensemble']
+    MODEL_NAMES = ['xgboost', 'lightgbm', 'random_forest', 'catboost', 'ensemble']
     print("\n" + "="*100)
     print("RUNNING CROSS-SECTIONAL PORTFOLIO BACKTEST (top 5 by daily probability)")
     print("="*100)
@@ -1103,11 +1113,24 @@ if __name__ == '__main__':
     print("\n" + "="*100)
     print("MODEL COMPARISON (avg Sharpe of top-20 per model)")
     print("="*100)
+    
+    best_overall_model = None
+    best_overall_pnl = -float('inf')
+    
     for model_name in MODEL_NAMES:
         rows = backtest[model_name]
         avg_sharpe = np.mean([r['sharpe'] for r in rows]) if rows else 0
         avg_wr = np.mean([r['win_rate'] for r in rows]) if rows else 0
         print(f"  {model_name:16} → Top-20 avg Sharpe: {avg_sharpe:.2f} | avg WR: {avg_wr:.0f}% | stocks: {len(rows)}")
+        
+        pnl = sum(t['pnl_rs'] for t in portfolio_bt[model_name])
+        if pnl > best_overall_pnl:
+            best_overall_pnl = pnl
+            best_overall_model = model_name
+            
+    print("\n" + "="*100)
+    print(f"🏆 BEST PERFORMING MODEL: {best_overall_model.upper()} with Portfolio PnL of ₹{best_overall_pnl:,.0f}")
+    print("="*100)
 
     with open(OUTPUT_FILE, 'w') as f:
         json.dump({
