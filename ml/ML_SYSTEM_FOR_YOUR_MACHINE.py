@@ -778,6 +778,7 @@ def analyze_stock(symbol, name, cap_type):
             print("❌ Ensemble failed")
             return None
             
+        model_results['ensemble'] = ensemble_metrics
         ens = ensemble_metrics
 
         # ── Collect test-period data for cross-sectional portfolio backtest ──
