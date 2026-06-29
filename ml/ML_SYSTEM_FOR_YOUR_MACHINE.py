@@ -439,26 +439,103 @@ def cross_val_accuracy(model, X, y, n_splits=5):
         scores.append(accuracy_score(y[val_idx], m.predict(X[val_idx])))
     return float(np.mean(scores)) if scores else 0.0
 
+def compute_atr_array(high, low, close, period=14):
+    """Compute ATR array for every bar using rolling average of True Range."""
+    n = len(close)
+    tr = np.empty(n)
+    tr[0] = high[0] - low[0] if n > 0 else 0.0
+    for i in range(1, n):
+        tr[i] = max(high[i] - low[i], abs(high[i] - close[i-1]), abs(low[i] - close[i-1]))
+    atr = pd.Series(tr).rolling(period, min_periods=1).mean().values
+    return atr
+
 def backtest_long_signals(probas, df_clean, start_idx, horizon, threshold=PREDICTION_THRESHOLD):
-    """Long-only backtest with anti-chase filter."""
-    trade_results = []
-    for i in range(start_idx, len(df_clean) - horizon):
+    """Long-only backtest with anti-chase filter and SL/target tracking."""
+    trade_records = []
+    
+    # Pre-extract to numpy arrays for massive speedup
+    open_arr = df_clean['Open'].values
+    close_arr = df_clean['Close'].values
+    high_arr = df_clean['High'].values
+    low_arr = df_clean['Low'].values
+    dates_arr = df_clean['Date'].values if 'Date' in df_clean.columns else None
+    
+    n_days = len(close_arr)
+    
+    for i in range(start_idx, n_days - horizon):
         if probas[i - start_idx] <= threshold:
             continue
         if i >= 1:
-            prev_ret = abs((df_clean['Close'].iloc[i] - df_clean['Close'].iloc[i - 1]) / df_clean['Close'].iloc[i - 1])
+            prev_ret = abs((close_arr[i] - close_arr[i - 1]) / close_arr[i - 1])
             if prev_ret > CHASE_FILTER:
                 continue
-        entry = df_clean['Close'].iloc[i]
-        exit_price = df_clean['Close'].iloc[i + horizon]
-        pnl = (exit_price - entry) / entry * 100
-        trade_results.append(pnl)
-    return trade_results
+        entry = float(close_arr[i])
+
+        # Compute ATR at entry (14-period) for point-in-time SL/target
+        atr_start = max(1, i - 13)
+        trs = []
+        for j in range(atr_start, i + 1):
+            tr = max(
+                float(high_arr[j] - low_arr[j]),
+                abs(float(high_arr[j] - close_arr[j - 1])),
+                abs(float(low_arr[j] - close_arr[j - 1]))
+            )
+            trs.append(tr)
+        atr = float(np.mean(trs)) if trs else entry * 0.02
+
+        hold_scale = horizon / 5.0
+        sl_price = entry - 2.2 * atr
+        t1_price = entry + 1.3 * atr * hold_scale
+
+        # Walk through holding period: check SL/target intra-trade
+        actual_exit = float(close_arr[i + horizon])
+        exit_reason = 'hold'
+        for k in range(1, horizon + 1):
+            day_open = float(open_arr[i + k])
+            day_low = float(low_arr[i + k])
+            day_high = float(high_arr[i + k])
+            if day_open <= sl_price:
+                actual_exit = day_open
+                exit_reason = 'sl'
+                break
+            if day_low <= sl_price:
+                actual_exit = sl_price
+                exit_reason = 'sl'
+                break
+            if day_open >= t1_price:
+                actual_exit = t1_price
+                exit_reason = 'target'
+                break
+            if day_high >= t1_price:
+                actual_exit = t1_price
+                exit_reason = 'target'
+                break
+
+        pnl_pct = (actual_exit - entry) / entry * 100
+
+        entry_date = ''
+        if dates_arr is not None:
+            entry_date = str(pd.to_datetime(dates_arr[i]).date())
+
+        trade_records.append({
+            'd': entry_date,
+            'ep': round(entry, 2),
+            'xp': round(actual_exit, 2),
+            'sl': round(sl_price, 2),
+            't1': round(t1_price, 2),
+            'h': horizon,
+            'pnl': round(pnl_pct, 2),
+            'exit': exit_reason,
+        })
+    return trade_records
 
 def compute_metrics(trade_results, horizon):
     if len(trade_results) < MIN_TRADES:
         return None
-    arr = np.array(trade_results)
+    if trade_results and isinstance(trade_results[0], dict):
+        arr = np.array([t['pnl'] for t in trade_results])
+    else:
+        arr = np.array(trade_results)
     mean_r = float(np.mean(arr))
     std_r = float(np.std(arr)) + 1e-8
     sharpe = mean_r / std_r * np.sqrt(252 / horizon)
@@ -519,6 +596,8 @@ def run_model_pipeline(model, X_train, y_train, X_all, df_clean, train_size, hor
     metrics['cv_accuracy'] = cv_accuracy
     metrics['selected_features'] = int(X_train_sel.shape[1])
     metrics['horizon'] = horizon
+    metrics['trade_log'] = trade_results
+    metrics['probas'] = probas.tolist()
     return metrics
 
 def run_ensemble_pipeline(models, X_train, y_train, X_all, df_clean, train_size, horizon):
@@ -553,6 +632,8 @@ def run_ensemble_pipeline(models, X_train, y_train, X_all, df_clean, train_size,
     metrics['cv_accuracy'] = float(np.mean(cv_scores))
     metrics['selected_features'] = int(X_train_sel.shape[1])
     metrics['horizon'] = horizon
+    metrics['trade_log'] = trade_results
+    metrics['probas'] = ensemble_probas.tolist()
     return metrics
 
 def run_horizon_ensemble(df_clean, horizon):
@@ -604,6 +685,8 @@ def analyze_stock(symbol, name, cap_type):
             metrics = run_horizon_ensemble(df_clean, h)
             if metrics:
                 metrics['composite_score'] = horizon_composite_score(metrics)
+                metrics.pop('trade_log', None)
+                metrics.pop('probas', None)
                 horizon_comparison[str(h)] = metrics
 
         if not horizon_comparison:
@@ -647,6 +730,36 @@ def analyze_stock(symbol, name, cap_type):
             model_results['ensemble'] = ensemble_metrics
 
         ens = model_results.get('ensemble', best_ens)
+
+        # ── Collect test-period data for cross-sectional portfolio backtest ──
+        test_dates = []
+        if 'Date' in df_valid.columns:
+            test_dates = [str(pd.to_datetime(d).date()) for d in df_valid['Date'].values[train_size:]]
+        test_close = df_valid['Close'].values[train_size:].astype(float)
+        test_open = df_valid['Open'].values[train_size:].astype(float)
+        test_high = df_valid['High'].values[train_size:].astype(float)
+        test_low = df_valid['Low'].values[train_size:].astype(float)
+        full_atr = compute_atr_array(
+            df_valid['High'].values.astype(float),
+            df_valid['Low'].values.astype(float),
+            df_valid['Close'].values.astype(float),
+        )
+        test_atr = full_atr[train_size:]
+        test_probs = {}
+        for mn, mr in model_results.items():
+            if 'probas' in mr:
+                test_probs[mn] = mr['probas']
+        test_data = {
+            'name': name,
+            'dates': test_dates,
+            'open': test_open,
+            'close': test_close,
+            'high': test_high,
+            'low': test_low,
+            'atr': test_atr,
+            'horizon': best_h,
+            'probs': test_probs,
+        }
 
         atr = float(X_feat['atr'].iloc[-1])
         current_price = float(df_clean['Close'].iloc[-1])
@@ -692,6 +805,7 @@ def analyze_stock(symbol, name, cap_type):
             'trades': ens['trades'],
             'cv_accuracy': ens['cv_accuracy'],
             'model_results': model_results,
+            'test_data': test_data,
         }
     except Exception as e:
         print(f"❌ {str(e)[:40]}")
@@ -725,7 +839,130 @@ def result_for_model(stock, model_name):
         't1': stock['t1'],
         't2': stock['t2'],
         'atr': stock['atr'],
+        'today_prob': m.get('today_prob', 0),
+        'trade_log': m.get('trade_log', []),
     }
+
+def portfolio_backtest(stocks_test_data, model_name,
+                       threshold=PREDICTION_THRESHOLD, max_positions=5, notional=10000):
+    """Cross-sectional point-in-time portfolio backtest — no look-ahead bias.
+
+    Walks every trading day across the test set, picks top stocks by
+    model probability, deploys notional per stock with SL/target from ATR.
+    """
+    stock_lookup = {}
+    all_date_set = set()
+    for sym, data in stocks_test_data.items():
+        probs = data['probs'].get(model_name)
+        if probs is None or len(probs) == 0:
+            continue
+        date_to_idx = {d: i for i, d in enumerate(data['dates'])}
+        stock_lookup[sym] = {
+            'name': data['name'],
+            'date_to_idx': date_to_idx,
+            'open': np.array(data.get('open', data['close']), dtype=float),
+            'close': np.array(data['close'], dtype=float),
+            'high': np.array(data['high'], dtype=float),
+            'low': np.array(data['low'], dtype=float),
+            'atr': np.array(data['atr'], dtype=float),
+            'probs': np.array(probs, dtype=float),
+            'horizon': data['horizon'],
+        }
+        all_date_set.update(data['dates'])
+
+    if not stock_lookup:
+        return []
+
+    all_dates = sorted(all_date_set)
+    open_positions = {}
+    trade_log = []
+
+    for date in all_dates:
+        # ── 1. Manage existing positions ──
+        for sym in list(open_positions.keys()):
+            pos = open_positions[sym]
+            lu = stock_lookup[sym]
+            idx = lu['date_to_idx'].get(date)
+            if idx is None:
+                continue
+            pos['days_held'] += 1
+            day_open = float(lu['open'][idx])
+            day_low = float(lu['low'][idx])
+            day_high = float(lu['high'][idx])
+            day_close = float(lu['close'][idx])
+
+            exit_price, exit_reason = None, None
+            if day_open <= pos['sl']:
+                exit_price, exit_reason = day_open, 'sl'
+            elif day_low <= pos['sl']:
+                exit_price, exit_reason = pos['sl'], 'sl'
+            elif day_open >= pos['t1']:
+                exit_price, exit_reason = day_open, 'target'
+            elif day_high >= pos['t1']:
+                exit_price, exit_reason = pos['t1'], 'target'
+            elif pos['days_held'] >= lu['horizon']:
+                exit_price, exit_reason = day_close, 'hold'
+
+            if exit_price is not None:
+                pnl_rs = pos['shares'] * (exit_price - pos['entry_price'])
+                trade_log.append({
+                    's': sym, 'n': lu['name'],
+                    'd': pos['entry_date'], 'xd': date,
+                    'ep': round(pos['entry_price'], 2),
+                    'xp': round(exit_price, 2),
+                    'sl': round(pos['sl'], 2),
+                    't1': round(pos['t1'], 2),
+                    'h': lu['horizon'],
+                    'shares': pos['shares'],
+                    'pnl_rs': round(pnl_rs, 2),
+                    'pnl': round((exit_price - pos['entry_price']) / pos['entry_price'] * 100, 2),
+                    'exit': exit_reason,
+                })
+                del open_positions[sym]
+
+        # ── 2. New entries ──
+        candidates = []
+        for sym, lu in stock_lookup.items():
+            if sym in open_positions:
+                continue
+            idx = lu['date_to_idx'].get(date)
+            if idx is None or idx >= len(lu['probs']):
+                continue
+            prob = float(lu['probs'][idx])
+            if prob <= threshold:
+                continue
+            entry_price = float(lu['close'][idx])
+            # Anti-chase filter
+            if idx > 0:
+                prev_close = float(lu['close'][idx - 1])
+                if prev_close > 0 and abs(entry_price - prev_close) / prev_close > CHASE_FILTER:
+                    continue
+            candidates.append((sym, prob, idx))
+
+        if not candidates:
+            continue
+        candidates.sort(key=lambda x: x[1], reverse=True)
+        for sym, prob, idx in candidates:
+            lu = stock_lookup[sym]
+            entry_price = float(lu['close'][idx])
+            atr_val = float(lu['atr'][idx])
+            if atr_val <= 0 or entry_price <= 0:
+                continue
+            horizon = lu['horizon']
+            shares = int(notional // entry_price)
+            if shares <= 0:
+                continue
+            hold_scale = horizon / 5.0
+            open_positions[sym] = {
+                'entry_date': date,
+                'entry_price': entry_price,
+                'sl': entry_price - 2.2 * atr_val,
+                't1': entry_price + 1.3 * atr_val * hold_scale,
+                'shares': shares,
+                'days_held': 0,
+            }
+
+    return trade_log
 
 # ═══════════════════════════════════════════════════════════════
 # MAIN EXECUTION
@@ -740,14 +977,47 @@ if __name__ == '__main__':
     print(f"Target: volume+time weighted | Anti-chase: {CHASE_FILTER*100:.0f}% | Universe: {len(STOCKS)} stocks\n")
 
     all_results = []
-    for symbol, name, cap in STOCKS:
+    for symbol, name, cap in STOCKS[:15]:
         result = analyze_stock(symbol, name, cap)
         if result:
             all_results.append(result)
 
     all_results.sort(key=lambda x: x['sharpe'], reverse=True)
 
+    # ── Cross-sectional portfolio backtest (no look-ahead bias) ──
     MODEL_NAMES = ['xgboost', 'lightgbm', 'random_forest', 'ensemble']
+    print("\n" + "="*100)
+    print("RUNNING CROSS-SECTIONAL PORTFOLIO BACKTEST (top 5 by daily probability)")
+    print("="*100)
+    stocks_test_data = {}
+    for r in all_results:
+        td = r.get('test_data')
+        if td and len(td.get('dates', [])) > 0:
+            stocks_test_data[r['symbol']] = td
+    print(f"  {len(stocks_test_data)} stocks with test-period data")
+
+    portfolio_bt = {}
+    for model_name in MODEL_NAMES:
+        tlog = portfolio_backtest(stocks_test_data, model_name)
+        portfolio_bt[model_name] = tlog
+        total_pnl = sum(t['pnl_rs'] for t in tlog)
+        wins = sum(1 for t in tlog if t['pnl_rs'] > 0)
+        sl_exits = sum(1 for t in tlog if t['exit'] == 'sl')
+        tgt_exits = sum(1 for t in tlog if t['exit'] == 'target')
+        hold_exits = sum(1 for t in tlog if t['exit'] == 'hold')
+        unique_stocks = len(set(t['s'] for t in tlog)) if tlog else 0
+        print(f"  {model_name:16} → {len(tlog)} trades | {unique_stocks} stocks | "
+              f"PnL: ₹{total_pnl:,.0f} | W/L: {wins}/{len(tlog)-wins} | "
+              f"SL:{sl_exits} TGT:{tgt_exits} HOLD:{hold_exits}")
+
+    # Strip heavy internal data before JSON serialization
+    for r in all_results:
+        r.pop('test_data', None)
+        for mr in r.get('model_results', {}).values():
+            probas = mr.pop('probas', None)
+            if probas and len(probas) > 0:
+                mr['today_prob'] = probas[-1]
+
     backtest = {}
     for model_name in MODEL_NAMES:
         model_rows = []
@@ -812,6 +1082,7 @@ if __name__ == '__main__':
             'horizon_distribution': horizon_counts,
             'results': ensemble_top[:20],
             'backtest': backtest,
+            'portfolio_backtest': portfolio_bt,
         }, f, indent=2, default=str)
 
     print(f"\n✓ Results saved to {OUTPUT_FILE}")
