@@ -1027,7 +1027,7 @@ if __name__ == '__main__':
     print(f"Target: volume+time weighted | Anti-chase: {CHASE_FILTER*100:.0f}% | Universe: {len(STOCKS)} stocks\n")
 
     all_results = []
-    for symbol, name, cap in STOCKS[:15]:
+    for symbol, name, cap in STOCKS:
         result = analyze_stock(symbol, name, cap)
         if result:
             all_results.append(result)
