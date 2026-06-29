@@ -29,7 +29,7 @@ import warnings
 warnings.filterwarnings('ignore')
 
 SCRIPT_DIR = Path(__file__).resolve().parent
-OUTPUT_FILE = SCRIPT_DIR / "ml_results_final.json"
+OUTPUT_FILE = SCRIPT_DIR.parent / "public" / "ml_results_final.json"
 
 HORIZON_CANDIDATES = [3, 5, 7]
 PREDICTION_THRESHOLD = 0.40
